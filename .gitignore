@@ -1,0 +1,33 @@
+# Credenciais
+.env
+.env.*
+!.env.example
+
+# Ambiente virtual
+venv/
+.venv/
+venv_tray/
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Relatórios e artefatos gerados pelo TrayBot
+sync_report_*.csv
+report.csv
+
+# Logs
+*.log
+
+# Playwright/local debug artifacts
+playwright-report/
+test-results/
+*.har
+*.trace
+trace.zip
+
+# Sistema/Editor
+.DS_Store
+Thumbs.db
+.vscode/
