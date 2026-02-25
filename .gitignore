@@ -31,3 +31,7 @@ trace.zip
 .DS_Store
 Thumbs.db
 .vscode/
+
+*.txt
+*.csv
+*.json
