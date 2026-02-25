@@ -1140,6 +1140,26 @@ def extract_edit_snapshot(page: Page) -> dict:
                 return isLikelyNumeric(value) ? value : '';
             };
 
+            const getNumericBySelectors = (selectors) => {
+                for (const selector of selectors) {
+                    const el = document.querySelector(selector);
+                    const val = safeNumericValue(el);
+                    if (val) return val;
+                }
+                return '';
+            };
+
+            const getNumericByLabel = (labelText) => {
+                const byExplicit = safeNumericValue(getByExplicitLabel(labelText));
+                if (byExplicit) return byExplicit;
+
+                const byNear = safeNumericValue(getInputNearText(labelText));
+                if (byNear) return byNear;
+
+                const byGeneric = safeNumericValue(getByLabel(labelText, 'input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"])'));
+                return byGeneric;
+            };
+
             const getDimsFromSection = () => {
                 const cards = [...document.querySelectorAll('.app-card, .app-card__body, .card, .card-body, section')];
                 const section = cards.find((s) => {
@@ -1264,6 +1284,27 @@ def extract_edit_snapshot(page: Page) -> dict:
                 getInputNearText('referencia');
             const garantiaSelect = getByExplicitLabel('tempo de garantia') || getByLabel('tempo de garantia', 'select');
             const dimsBySection = getDimsFromSection();
+            const explicitDims = {
+                peso: getNumericBySelectors(['#__BVID__1942', 'input[name*="peso" i]', 'input[id*="peso" i]']),
+                altura: getNumericBySelectors(['#__BVID__1947', 'input[name*="altura" i]', 'input[id*="altura" i]']),
+                largura: getNumericBySelectors(['#__BVID__1951', 'input[name*="largura" i]', 'input[id*="largura" i]']),
+                comprimento: getNumericBySelectors(['#__BVID__1955', 'input[name*="comprimento" i]', 'input[id*="comprimento" i]']),
+            };
+            const labelDims = {
+                peso: getNumericByLabel('peso') || getNumericByLabel('peso (kg)'),
+                altura: getNumericByLabel('altura'),
+                largura: getNumericByLabel('largura'),
+                comprimento: getNumericByLabel('comprimento'),
+            };
+            const precoVenda = getNumericBySelectors([
+                '#__BVID__1908',
+                'input[name*="price" i]:not([name*="promot" i])',
+                'input[id*="price" i]:not([id*="promot" i])',
+            ]) ||
+            getNumericByLabel('preço de venda') ||
+            getNumericByLabel('preco de venda') ||
+            getNumericByLabel('valor de venda') ||
+            getNumericByLabel('preço');
 
             return {
                 url: window.location.href,
@@ -1274,18 +1315,73 @@ def extract_edit_snapshot(page: Page) -> dict:
                     nome_produto: getTextInputValue(nomeField),
                     descricao_texto: getCkEditorText(),
                     referencia: getTextInputValue(referenciaField),
+                    preco_venda: precoVenda,
                     tempo_garantia: getInputValue(garantiaSelect),
-                    peso: dimsBySection.peso,
-                    altura: dimsBySection.altura,
-                    largura: dimsBySection.largura,
-                    comprimento: dimsBySection.comprimento,
+                    peso: explicitDims.peso || labelDims.peso || dimsBySection.peso,
+                    altura: explicitDims.altura || labelDims.altura || dimsBySection.altura,
+                    largura: explicitDims.largura || labelDims.largura || dimsBySection.largura,
+                    comprimento: explicitDims.comprimento || labelDims.comprimento || dimsBySection.comprimento,
                     image_count: uniqImages.length,
+                    image_urls: uniqImages.map((img) => img.src),
                 },
             };
         }
         """
     )
-    return snapshot or {"url": page.url, "title": "", "fields": {}, "images": []}
+    snapshot = snapshot or {"url": page.url, "title": "", "fields": {}, "images": []}
+
+    structured = snapshot.get("structured") if isinstance(snapshot, dict) else None
+    fields = snapshot.get("fields") if isinstance(snapshot, dict) else None
+
+    if isinstance(structured, dict) and isinstance(fields, dict):
+        dim_keys = ["peso", "altura", "largura", "comprimento"]
+        missing_dims = any(not (structured.get(key) or "").strip() for key in dim_keys)
+
+        if missing_dims:
+            digital_meta = fields.get("key-weight-dimensions")
+            is_digital_product = False
+
+            if isinstance(digital_meta, dict):
+                digital_value = digital_meta.get("value")
+                if isinstance(digital_value, dict):
+                    is_digital_product = bool(digital_value.get("checked"))
+                elif isinstance(digital_value, bool):
+                    is_digital_product = digital_value
+
+            if not is_digital_product:
+                ordered_fields = list(fields.items())
+                start_idx = next((idx for idx, (key, _) in enumerate(ordered_fields) if key == "key-weight-dimensions"), -1)
+
+                if start_idx >= 0:
+                    dim_values: list[str] = []
+                    for _, meta in ordered_fields[start_idx + 1 :]:
+                        if not isinstance(meta, dict):
+                            continue
+
+                        field_type = str(meta.get("type") or "").strip().lower()
+                        if field_type not in {"text", "number"}:
+                            continue
+
+                        value = meta.get("value")
+                        if isinstance(value, (dict, list)):
+                            continue
+
+                        text = str(value or "").strip()
+                        if not text:
+                            continue
+                        if not re.fullmatch(r"\d+(?:[\.,]\d+)?", text):
+                            continue
+
+                        dim_values.append(text)
+                        if len(dim_values) == 4:
+                            break
+
+                    if len(dim_values) == 4:
+                        for key, value in zip(dim_keys, dim_values):
+                            if not (structured.get(key) or "").strip():
+                                structured[key] = value
+
+    return snapshot
 
 
 def create_product(page: Page, target_admin_url: str, payload: ProductPayload) -> tuple[bool, str]:
