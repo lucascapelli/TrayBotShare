@@ -3,6 +3,10 @@ import csv
 import json
 import os
 import re
+import tempfile
+from PIL import Image
+import io
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
@@ -10,17 +14,29 @@ from dotenv import load_dotenv
 from typing import Callable
 import unicodedata
 
+# Carrega variáveis do .env
 load_dotenv()
 
-SOURCE_URL = os.getenv("SOURCE_URL", "")
-SOURCE_USER = os.getenv("SOURCE_USER", "")
-SOURCE_PASS = os.getenv("SOURCE_PASS", "")
-SOURCE_STORE_ID = os.getenv("SOURCE_STORE_ID", "")
-
-TARGET_URL = os.getenv("TARGET_URL", "")
-TARGET_USER = os.getenv("TARGET_USER", "")
-TARGET_PASS = os.getenv("TARGET_PASS", "")
-TARGET_STORE_ID = os.getenv("TARGET_STORE_ID", "")
+def download_and_convert_image(url: str) -> str:
+    try:
+        with urllib.request.urlopen(url) as response:
+            data = response.read()
+            ext = os.path.splitext(url)[1].lower()
+            # Converte para JPEG se não for permitido
+            if ext not in {'.jpg', '.jpeg', '.png'}:
+                ext = '.jpg'
+                img = Image.open(io.BytesIO(data))
+                rgb_img = img.convert('RGB')
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                    rgb_img.save(tmp, format='JPEG')
+                    return tmp.name
+            else:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                    tmp.write(data)
+                    return tmp.name
+    except Exception as exc:
+        print(f"    [IMG] Falha ao baixar/converter imagem: {exc}")
+        return ""
 
 HEADLESS = os.getenv("HEADLESS", "false").strip().lower() in {"1", "true", "yes", "y"}
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() in {"1", "true", "yes", "y"}
@@ -1384,49 +1400,212 @@ def extract_edit_snapshot(page: Page) -> dict:
     return snapshot
 
 
-def create_product(page: Page, target_admin_url: str, payload: ProductPayload) -> tuple[bool, str]:
-    page.goto(admin_url(target_admin_url, "products/new"), wait_until="domcontentloaded")
+def _download_image_to_tempfile(url: str) -> "str | None":
+    """Downloads an image URL to a temporary file and returns its path. Returns None on error."""
     try:
-        page.wait_for_load_state("networkidle")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read()
+        suffix = ".jpg"
+        low = url.lower().split("?")[0]
+        if low.endswith(".png"):
+            suffix = ".png"
+        elif low.endswith(".gif"):
+            suffix = ".gif"
+        elif low.endswith(".webp"):
+            suffix = ".webp"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(data)
+        tmp.close()
+        return tmp.name
+    except Exception as exc:
+        print(f"    [IMG] Falha ao baixar {url}: {exc}")
+        return None
+
+
+def _set_ckeditor_content(page: Page, html_or_text: str) -> bool:
+    """Injects text/HTML into the first CKEditor instance on the page."""
+    result = page.evaluate(
+        """
+        (content) => {
+            if (window.CKEDITOR && window.CKEDITOR.instances) {
+                const instances = Object.values(window.CKEDITOR.instances || {});
+                for (const inst of instances) {
+                    try {
+                        inst.setData(content);
+                        return true;
+                    } catch (e) {}
+                }
+            }
+            return false;
+        }
+        """,
+        html_or_text,
+    )
+    return bool(result)
+
+
+def create_product(
+    page: Page,
+    target_admin_url: str,
+    payload: ProductPayload,
+    edit_snapshot: "dict | None" = None,
+) -> tuple[bool, str]:
+    """Creates a product in the destination store using form data extracted from the source."""
+
+    structured: dict = {}
+    if isinstance(edit_snapshot, dict):
+        s = edit_snapshot.get("structured")
+        if isinstance(s, dict):
+            structured = s
+
+    # ── Navegar para novo produto ──────────────────────────────────────────
+    page.goto(admin_url(target_admin_url, "products/new"), wait_until="domcontentloaded")
+    # Aguarda campo nome aparecer (mais rápido e robusto)
+    try:
+        page.wait_for_selector('input[name="name"], input[id*="nome"], input[name*="nome"]', timeout=5000)
     except TimeoutError:
         pass
 
+    # ── Nome ──────────────────────────────────────────────────────────────
     name_ok = safe_fill(
         page,
-        ['input[name="name"]', 'input[id*="name"]', 'input[name*="nome"]'],
+        [
+            "#__BVID__2125",  # ID real do campo Nome
+            'input[name="name"]',
+            'input[id*="nome"]',
+            'input[name*="nome"]',
+            'input[placeholder*="nome" i]',
+        ],
         payload.name,
     )
     sku_ok = safe_fill(
         page,
-        ['input[name*="reference"]', 'input[name*="referencia"]', 'input[name="sku"]', 'input[id*="reference"]', 'input[id*="sku"]'],
+        [
+            "#__BVID__2004",  # ID real do campo Referência
+            'input[name*="reference"]',
+            'input[name*="referencia"]',
+            'input[id*="reference"]',
+            'input[placeholder*="referência" i]',
+        ],
         payload.sku,
     )
 
-    if not name_ok or not sku_ok:
-        return False, "Falha ao preencher nome/SKU no formulário de destino."
+    # ── Peso e dimensões ──────────────────────────────────────────────────
+    peso = (structured.get("peso") or "").strip()
+    altura = (structured.get("altura") or "").strip()
+    largura = (structured.get("largura") or "").strip()
+    comprimento = (structured.get("comprimento") or "").strip()
+    if peso:
+        safe_fill(page, ["#__BVID__142705", 'input[name*="peso" i]', 'input[id*="peso" i]'], peso)
+    if altura:
+        safe_fill(page, ["#__BVID__142710", 'input[name*="altura" i]', 'input[id*="altura" i]'], altura)
+    if largura:
+        safe_fill(page, ["#__BVID__142714", 'input[name*="largura" i]', 'input[id*="largura" i]'], largura)
+    if comprimento:
+        safe_fill(page, ["#__BVID__142718", 'input[name*="comprimento" i]', 'input[id*="comprimento" i]'], comprimento)
 
-    open_additional_sections_if_needed(page)
+    # ── Descrição (CKEditor) ──────────────────────────────────────────────
+    descricao = (structured.get("descricao_texto") or payload.additional_info or "").strip()
+    if descricao:
+        # Aguarda CKEditor ou textarea aparecer
+        try:
+            page.wait_for_selector('iframe.cke_wysiwyg_frame, textarea[name*="description" i], textarea[id*="description" i], textarea[id*="descricao" i]', timeout=4000)
+        except TimeoutError:
+            pass
+        cke_ok = _set_ckeditor_content(page, descricao)
+        if not cke_ok:
+            safe_fill(
+                page,
+                ['textarea[name*="description" i]', 'textarea[id*="description" i]', 'textarea[id*="descricao" i]'],
+                descricao,
+            )
+
+    # ── Mensagem adicional ────────────────────────────────────────────────
     if payload.additional_info:
         safe_fill(
             page,
-            ['textarea[name*="additional"]', 'textarea[id*="additional"]', 'textarea[name*="informacao"]', 'textarea[id*="informacao"]', 'textarea[name*="info"]'],
+            [
+                "#__BVID__142481",
+                'textarea[name*="additional"]',
+                'textarea[id*="additional"]',
+                'textarea[name*="informacao"]',
+                'textarea[id*="informacao"]',
+                'textarea[name*="info"]',
+            ],
             payload.additional_info,
         )
 
+    # ── Imagens ───────────────────────────────────────────────────────────
+    image_urls: list[str] = structured.get("image_urls") or []
+    if not image_urls and isinstance(edit_snapshot, dict):
+        image_urls = [img.get("src", "") for img in edit_snapshot.get("images", []) if img.get("src")]
+
+    tmp_files: list[str] = []
+    if image_urls:
+        # Baixa imagens sem print detalhado
+        for img_url in image_urls:
+            tmp_path = _download_image_to_tempfile(img_url)
+            if tmp_path:
+                tmp_files.append(tmp_path)
+
+        if tmp_files:
+            file_input_selectors = [
+                'input.custom-file-input',
+                'input[type="file"]',
+            ]
+            uploaded = False
+            for sel in file_input_selectors:
+                locator = page.locator(sel)
+                if locator.count() == 0:
+                    continue
+                try:
+                    locator.first.set_input_files(tmp_files)
+                    uploaded = True
+                    break
+                except Exception:
+                    continue
+
+    # ── Salvar ────────────────────────────────────────────────────────────
+    # Aguarda botão salvar aparecer
+    try:
+        page.wait_for_selector('button.btn.page-product-detail__buttons-footer--button.btn-primary, button.btn-primary, button[type="submit"]', timeout=4000)
+    except TimeoutError:
+        pass
     save_clicked = safe_click(
         page,
-        ['button[type="submit"]', 'button:has-text("Salvar")', 'input[type="submit"]', '.btn-primary:has-text("Salvar")'],
+        [
+            'button.btn.page-product-detail__buttons-footer--button.btn-primary',
+            'button.btn-primary',
+            'button[type="submit"]',
+            'button:has-text("Salvar")',
+            '.btn-primary:has-text("Salvar")',
+        ],
     )
     if not save_clicked:
+        # Limpeza de temp files antes de retornar
+        for f in tmp_files:
+            try:
+                os.unlink(f)
+            except Exception:
+                pass
         return False, "Falha ao acionar botão Salvar."
 
+    # Aguarda algum feedback de sucesso/erro ou mudança de página
     try:
-        page.wait_for_load_state("networkidle")
+        page.wait_for_selector('.alert-danger, .error, .invalid-feedback, .toast-error, .alert-success, .toast-success', timeout=4000)
     except TimeoutError:
         pass
 
+    # Limpeza de temp files
+    for f in tmp_files:
+        try:
+            os.unlink(f)
+        except Exception:
+            pass
+
     error_text = ""
-    for selector in [".alert-danger", ".error", ".invalid-feedback"]:
+    for selector in [".alert-danger", ".error", ".invalid-feedback", ".toast-error"]:
         locator = page.locator(selector)
         if locator.count() > 0 and locator.first.is_visible():
             error_text = (locator.first.inner_text() or "").strip()
@@ -1476,6 +1655,15 @@ def write_details_report(file_name: str, records: list[dict]) -> None:
 
 
 def main() -> None:
+    SOURCE_URL = os.getenv("SOURCE_URL", "").strip()
+    TARGET_URL = os.getenv("TARGET_URL", "").strip()
+    SOURCE_USER = os.getenv("SOURCE_USER", "").strip()
+    SOURCE_PASS = os.getenv("SOURCE_PASS", "").strip()
+    TARGET_USER = os.getenv("TARGET_USER", "").strip()
+    TARGET_PASS = os.getenv("TARGET_PASS", "").strip()
+    SOURCE_STORE_ID = os.getenv("SOURCE_STORE_ID", "").strip()
+    TARGET_STORE_ID = os.getenv("TARGET_STORE_ID", "").strip()
+
     source_admin = normalize_admin_base(must_env(SOURCE_URL, "SOURCE_URL"))
     target_admin = normalize_admin_base(must_env(TARGET_URL, "TARGET_URL"))
     source_user = must_env(SOURCE_USER, "SOURCE_USER")
@@ -1568,13 +1756,13 @@ def main() -> None:
             if nk and nk not in target_by_name:
                 target_by_name[nk] = prod
 
+
         missing_keys: list[str] = []
         sku_mismatch: list[tuple[str, str, str]] = []
 
         print("\n── Comparação SKU por SKU ──")
         for source_key, source_prod in source_products.items():
             # Produto sem referência real (só código interno) — não é comparável por SKU
-            # Cai direto como faltante para inspeção manual via relatório
             if not source_key:
                 missing_keys.append(source_key)
                 continue
@@ -1583,22 +1771,7 @@ def main() -> None:
                 # Mesmo SKU normalizado encontrado no destino ✓
                 continue
 
-            # Não achou por SKU — verifica se existe pelo nome com SKU diferente
-            nk = name_key(source_prod.name)
-            if nk and nk in target_by_name:
-                target_prod = target_by_name[nk]
-                # Só reporta como divergência se o destino TAMBÉM tem um SKU real
-                # (não só código interno)
-                target_key = sku_key(target_prod.sku)
-                if target_key:
-                    sku_mismatch.append((source_key, target_key, source_prod.name))
-                    print(
-                        f"  ⚠️  SKU DIVERGENTE | '{source_prod.name}'\n"
-                        f"      ORIGEM='{source_key}' → DESTINO='{target_key}'"
-                    )
-                    continue  # Não adiciona como faltante — produto existe no destino
-
-            # Genuinamente faltante no destino
+            # Genuinamente faltante no destino: cadastra mesmo se existe produto com nome igual mas SKU diferente
             missing_keys.append(source_key)
 
         print(f"\nFaltantes genuínos: {len(missing_keys)}")
@@ -1672,7 +1845,9 @@ def main() -> None:
                         details_records.append(detail_record)
                         continue
 
-                    created, message = create_product(target_page, target_admin, payload)
+                    created, message = create_product(target_page, target_admin, payload, edit_snapshot)
+                    status_label = "✔ OK" if created else "✘ ERRO"
+                    print(f"  {status_label}: {message}")
                     report_rows.append(
                         {
                             "status": "OK" if created else "ERRO",
