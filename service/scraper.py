@@ -3,28 +3,121 @@ import json
 import time
 from urllib.parse import urljoin
 from patchright.sync_api import Page
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+from bs4 import BeautifulSoup
+from dataclasses import dataclass
+from datetime import datetime
 
 # =========================
-# 1) COLETA DO JSON DA EDIÇÃO - COM espera explícita e retry
+# CONFIGURAÇÕES
 # =========================
-def collect_product_data(page: Page, produto_id: str, timeout: int = 15000) -> dict:
+@dataclass
+class ScraperConfig:
+    timeout_per_product: int = 20000  # 20s por produto
+    max_retries: int = 3  # Tentar 3 vezes antes de desistir
+    retry_delay: int = 2000  # 2s entre tentativas
+    batch_size: int = 20  # Salvar a cada 20 produtos
+    max_pages: int = 300
+    max_scroll_attempts: int = 15
+    page_size: int = 25
+
+CONFIG = ScraperConfig()
+
+# =========================
+# UTILIDADES
+# =========================
+class ProgressTracker:
+    def __init__(self, total: int):
+        self.total = total
+        self.success = 0
+        self.failed = 0
+        self.retries = 0
+        self.start_time = time.time()
+        self.failed_ids = []
+    
+    def log_success(self, pid: str, name: str):
+        self.success += 1
+        if self.success % 10 == 0 or self.success == 1:
+            self._print_progress(f"✓ {pid} - {name[:40]}")
+    
+    def log_failure(self, pid: str, reason: str):
+        self.failed += 1
+        self.failed_ids.append(pid)
+        print(f"❌ [{self.current}/{self.total}] {pid} - {reason[:60]}")
+    
+    def log_retry(self, pid: str, attempt: int):
+        self.retries += 1
+        print(f"🔄 Retry {attempt}/{CONFIG.max_retries} para produto {pid}")
+    
+    @property
+    def current(self):
+        return self.success + self.failed
+    
+    def _print_progress(self, detail: str = ""):
+        elapsed = time.time() - self.start_time
+        rate = self.success / elapsed if elapsed > 0 else 0
+        eta = (self.total - self.current) / rate if rate > 0 else 0
+        
+        progress = (self.current / self.total * 100) if self.total > 0 else 0
+        print(f"[{self.current}/{self.total}] {progress:.1f}% | "
+              f"✓{self.success} ❌{self.failed} 🔄{self.retries} | "
+              f"⏱️{elapsed:.0f}s | ETA: {eta:.0f}s")
+        if detail:
+            print(f"  {detail}")
+    
+    def print_summary(self):
+        elapsed = time.time() - self.start_time
+        print("\n" + "="*60)
+        print("RESUMO DA COLETA")
+        print("="*60)
+        print(f"Total produtos: {self.total}")
+        print(f"Sucessos: {self.success} ({self.success/self.total*100:.1f}%)")
+        print(f"Falhas: {self.failed} ({self.failed/self.total*100:.1f}%)")
+        print(f"Retries: {self.retries}")
+        print(f"Tempo total: {elapsed/60:.1f} minutos")
+        print(f"Taxa: {self.success/elapsed*60:.1f} produtos/min")
+        
+        if self.failed_ids:
+            print(f"\nProdutos que falharam ({len(self.failed_ids)}):")
+            print(", ".join(self.failed_ids[:20]))
+            if len(self.failed_ids) > 20:
+                print(f"... e mais {len(self.failed_ids) - 20}")
+        print("="*60)
+
+def clean_html(html_text: str) -> str:
+    """Remove HTML tags e retorna texto limpo"""
+    if not html_text:
+        return ""
+    return BeautifulSoup(html_text, "html.parser").get_text(separator="\n").strip()
+
+def safe_float(value, default=None) -> Optional[float]:
+    """Converte string para float de forma segura"""
+    if not value:
+        return default
+    try:
+        return float(str(value).replace(",", "."))
+    except (ValueError, AttributeError):
+        return default
+
+# =========================
+# 1) COLETA DO JSON DA EDIÇÃO - COM RETRY
+# =========================
+def collect_product_data(page: Page, produto_id: str, attempt: int = 1) -> Optional[dict]:
     """
-    Captura o JSON de detalhe do produto usando um response listener (modo antigo, mais robusto).
-    timeout em ms.
+    Coleta dados de um produto com retry automático
     """
     product = {"produto_id": produto_id}
     detail_json = None
-
+    
     def handle_response(response):
         nonlocal detail_json
-        # se já capturamos, ignora
-        if detail_json:
+        if detail_json:  # Já capturou
             return
         try:
             ct = response.headers.get("content-type", "")
             if "application/json" not in ct:
                 return
+            
             data = response.json()
             if isinstance(data, dict) and "data" in data:
                 rid = data["data"].get("id")
@@ -32,312 +125,405 @@ def collect_product_data(page: Page, produto_id: str, timeout: int = 15000) -> d
                     return
                 if str(rid) == str(produto_id):
                     detail_json = data["data"]
-                    print(f"✅ JSON DETALHE CAPTURADO para {produto_id}")
         except Exception:
-            # silencioso — não queremos quebrar por causa de um response malformado
             return
-
+    
     page.on("response", handle_response)
-
+    
     try:
-        # navega (networkidle costuma garantir que as chamadas XHR acabem, mas mantemos o listener)
-        page.goto(f"https://www.grasiely.com.br/admin/products/{produto_id}/edit",
-                  wait_until="networkidle", timeout=timeout)
-    except Exception:
-        # podemos ignorar timeout aqui porque o listener ainda pode capturar a resposta
-        pass
-
-    # polling curto até timeout
-    waited = 0
-    interval = 250  # ms
-    while detail_json is None and waited < timeout:
-        page.wait_for_timeout(interval)
-        waited += interval
-
-    page.remove_listener("response", handle_response)
-
+        # Navega para página de edição
+        page.goto(
+            f"https://www.grasiely.com.br/admin/products/{produto_id}/edit",
+            wait_until="networkidle",
+            timeout=CONFIG.timeout_per_product
+        )
+        
+        # Espera pelo JSON com polling
+        waited = 0
+        interval = 300
+        while detail_json is None and waited < CONFIG.timeout_per_product:
+            page.wait_for_timeout(interval)
+            waited += interval
+            
+    except Exception as e:
+        print(f"⚠️ Erro na navegação para {produto_id}: {str(e)[:50]}")
+    finally:
+        page.remove_listener("response", handle_response)
+    
+    # Se não capturou e ainda tem tentativas, retry
     if not detail_json:
-        print(f"⚠️ Timeout/erro no produto {produto_id}: não capturou JSON em {timeout}ms")
+        if attempt < CONFIG.max_retries:
+            page.wait_for_timeout(CONFIG.retry_delay)
+            return collect_product_data(page, produto_id, attempt + 1)
+        else:
+            return None  # Falhou após todas as tentativas
+    
+    # Parse dos dados
+    try:
+        d = detail_json
+        
+        # Extrai informações do SEO
+        seo_title = None
+        seo_description = None
+        metatags = d.get("metatag", [])
+        for tag in metatags:
+            if tag.get("type") == "title":
+                seo_title = tag.get("content")
+            elif tag.get("type") == "description":
+                seo_description = tag.get("content")
+        
+        # Extrai primeira imagem
+        images = d.get("ProductImage", [])
+        first_image = images[0].get("https") if images and len(images) > 0 else None
+        
+        # URL do produto
+        url_obj = d.get("url", {})
+        product_url = url_obj.get("https") if isinstance(url_obj, dict) else None
+        
+        product.update({
+            "nome": d.get("name"),
+            "preco": safe_float(d.get("price")),
+            "descricao": clean_html(d.get("description", "")),
+            "estoque": d.get("stock"),
+            "estoque_minimo": d.get("minimum_stock"),
+            "categoria": d.get("category_name"),
+            "referencia": d.get("reference"),
+            "peso": d.get("weight"),
+            "altura": d.get("height"),
+            "largura": d.get("width"),
+            "comprimento": d.get("length"),
+            "imagem_url": first_image,
+            "notificacao_estoque_baixo": d.get("minimum_stock_alert") == "1",
+            "itens_inclusos": d.get("included_items"),
+            "mensagem_adicional": d.get("additional_message"),
+            "tempo_garantia": d.get("warranty"),
+            "ativo": d.get("active") == "1",
+            "visivel": d.get("visible") == "1",
+            "seo_preview": {
+                "link": product_url,
+                "title": seo_title,
+                "description": seo_description
+            }
+        })
+        
         return product
-
-    d = detail_json
-    product.update({
-        "nome": d.get("name"),
-        "preco": float(d.get("price", "0").replace(",", ".")) if d.get("price") else None,
-        "descricao": d.get("description"),
-        "estoque": d.get("stock"),
-        "estoque_minimo": d.get("minimum_stock"),
-        "categoria": d.get("category_name"),
-        "referencia": d.get("reference"),
-        "peso": d.get("weight"),
-        "altura": d.get("height"),
-        "largura": d.get("width"),
-        "comprimento": d.get("length"),
-        "imagem_url": (d.get("ProductImage") or [{}])[0].get("https") if d.get("ProductImage") else None,
-        "notificacao_estoque_baixo": d.get("minimum_stock_alert") == "1",
-        "itens_inclusos": d.get("included_items"),
-        "mensagem_adicional": d.get("additional_message"),
-        "tempo_garantia": d.get("warranty"),
-        "seo_preview": {
-            "link": (d.get("url") or {}).get("https"),
-            "title": next((m.get("content") for m in d.get("metatag", []) if m.get("type") == "title"), None),
-            "description": next((m.get("content") for m in d.get("metatag", []) if m.get("type") == "description"), None)
-        }
-    })
-    return product
+        
+    except Exception as e:
+        print(f"❌ Erro ao parsear JSON do produto {produto_id}: {str(e)}")
+        return None
 
 # =========================
-# 2) CAPTURA IDS - PAGINAÇÃO ROBUSTA (com limite de tentativas de scroll)
+# 2) CAPTURA IDS - PAGINAÇÃO ROBUSTA
 # =========================
-def collect_all_edit_urls(page: Page, base_list_url: str) -> List[Tuple[str, str]]:
+def collect_all_product_ids(page: Page, base_list_url: str) -> List[str]:
     """
-    Tenta interceptar respostas de listagem paginada. Usa:
-     • expect_response para a primeira página
-     • tentativa de clicar botão 'next' via vários seletores
-     • fallback para scroll infinito/dom extraction se necessário
-    Retorna lista de (produto_id, url_edit).
+    Coleta todos os IDs de produtos via interceptação de API e paginação
     """
     all_ids = set()
-    captured_responses = []
-
+    captured_pages = []
+    
     def is_list_response(response):
+        """Identifica se a resposta é da listagem de produtos"""
         try:
-            return ("products-search" in response.url or "/api/products" in response.url) \
-                   and response.status == 200 \
-                   and "application/json" in response.headers.get("content-type", "")
+            url = response.url
+            return (
+                ("products-search" in url or "/api/products" in url) and
+                response.status == 200 and
+                "application/json" in response.headers.get("content-type", "")
+            )
         except:
             return False
-
-    print("Iniciando coleta via interceptação com paginação...")
-    # captura primeira página
+    
+    print("🔍 Iniciando coleta de IDs via interceptação de API...")
+    
+    # Primeira página
     try:
-        with page.expect_response(is_list_response, timeout=10000) as r:
+        with page.expect_response(is_list_response, timeout=10000) as response_info:
             page.goto(base_list_url, wait_until="networkidle", timeout=30000)
-        response = r.value
+        
+        response = response_info.value
         data = response.json()
+        
         if data.get("data"):
-            captured_responses.append(data)
-            print(f"Página 1: {len(data['data'])} produtos")
+            captured_pages.append(data)
+            page_ids = [str(item.get("id")) for item in data["data"] if item.get("id")]
+            all_ids.update(page_ids)
+            print(f"✓ Página 1: {len(page_ids)} produtos")
     except Exception as e:
-        print(f"⚠️ Não capturou resposta da primeira página: {e}")
-        # continua para tentar extrair via DOM
-
-    max_pages = 300
+        print(f"⚠️ Erro ao capturar primeira página: {str(e)[:60]}")
+        # Continua mesmo assim, pode conseguir via DOM
+    
+    # Paginação
     current_page = 1
-
-    # novo: contador de tentativas de fallback (scroll/extraction)
-    scroll_attempts = 0
-    max_scroll_attempts = 15  # <-- máximo de vezes que imprimirá o fallback antes de desistir
-
-    while current_page < max_pages:
-        # tentativa de localizar botão next por várias estratégias
-        clicked = False
-        try:
-            # 1) tentativa por aria/role
-            try:
-                next_btn = page.get_by_role("button", name=re.compile(r"next|próxima|>',',',", re.I))
-            except:
-                next_btn = None
-            # 2) seletor comum
-            selectors = [
-                "a.next:not(.disabled)",
-                "button.next:not([disabled])",
-                ".pagination a[rel='next']:not(.disabled)",
-                "a[aria-label*='next']:not([aria-disabled='true'])",
-                "button[aria-label*='next']:not([aria-disabled='true'])",
-                "a:has-text('Próxima'):not(.disabled)",
-                "a:has-text('Next'):not(.disabled)",
-            ]
-            # try role-based click first if exists and visible
-            if next_btn and getattr(next_btn, "count", lambda: 1)() > 0:
-                try:
-                    if next_btn.is_visible():
-                        current_page += 1
-                        print(f"Ir para página {current_page} (role click)...")
-                        with page.expect_response(is_list_response, timeout=15000) as r:
-                            next_btn.click()
-                        response = r.value
-                        data = response.json()
-                        if data.get("data"):
-                            captured_responses.append(data)
-                            print(f"Página {current_page}: {len(data['data'])} produtos")
-                            clicked = True
-                            scroll_attempts = 0
-                            continue
-                except Exception:
-                    pass
-
-            # try selectors
-            for sel in selectors:
-                try:
-                    locator = page.locator(sel)
-                    if locator.count() > 0:
-                        loc = locator.first
-                        if loc.is_visible():
-                            current_page += 1
-                            print(f"Ir para página {current_page} (selector '{sel}')...")
-                            with page.expect_response(is_list_response, timeout=15000) as r:
-                                loc.click()
-                            response = r.value
-                            data = response.json()
-                            if data.get("data"):
-                                captured_responses.append(data)
-                                print(f"Página {current_page}: {len(data['data'])} produtos")
-                            clicked = True
-                            scroll_attempts = 0
-                            break
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"[WARN] Erro ao tentar localizar/clicar next: {e}")
-
-        if clicked:
-            # continue paginando
+    no_progress_count = 0
+    
+    while current_page < CONFIG.max_pages and no_progress_count < CONFIG.max_scroll_attempts:
+        previous_count = len(all_ids)
+        
+        # Tenta encontrar e clicar no botão "próxima"
+        next_clicked = try_click_next_page(page, current_page, is_list_response, all_ids)
+        
+        if next_clicked:
+            current_page += 1
+            no_progress_count = 0
             continue
-
-        # fallback: scroll infinito / extrair mais do DOM
-        scroll_attempts += 1
-        if scroll_attempts > max_scroll_attempts:
-            print(f"[INFO] Alcançado máximo de {max_scroll_attempts} tentativas de scroll/extracão - finalizando paginação")
-            break
-
-        print(f"[INFO] ({scroll_attempts}/{max_scroll_attempts}) Sem botão next ou clique falhou. Tentando scroll / extração DOM...")
-        previous_count = len(captured_responses)
-        # força scroll para tentar acionar APIs
+        
+        # Se não achou botão, tenta scraping do DOM
+        new_ids_found = extract_ids_from_dom(page, all_ids)
+        
+        if len(all_ids) > previous_count:
+            no_progress_count = 0
+        else:
+            no_progress_count += 1
+            print(f"[INFO] Sem progresso ({no_progress_count}/{CONFIG.max_scroll_attempts})")
+        
+        # Tenta scroll para carregar mais
         try:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(1500)
-        except Exception:
+        except:
             pass
+    
+    all_ids_list = sorted(list(all_ids), key=lambda x: int(x) if x.isdigit() else 0)
+    print(f"✅ Total de {len(all_ids_list)} IDs únicos capturados")
+    
+    return all_ids_list
 
-        # tenta extrair via JS os ids que já estão no DOM
+def try_click_next_page(page: Page, current_page: int, is_list_response, all_ids: set) -> bool:
+    """
+    Tenta encontrar e clicar no botão de próxima página
+    Retorna True se conseguiu clicar e capturar dados
+    """
+    selectors = [
+        "a.next:not(.disabled)",
+        "button.next:not([disabled])",
+        ".pagination a[rel='next']:not(.disabled)",
+        "a[aria-label*='next']:not([aria-disabled='true'])",
+        "button[aria-label*='next']:not([aria-disabled='true'])",
+        "a:has-text('Próxima'):not(.disabled)",
+        "a:has-text('Next'):not(.disabled)",
+        "li.page-item:not(.disabled) a[aria-label='Next']",
+    ]
+    
+    for selector in selectors:
         try:
-            ids_on_page = page.evaluate("""
-                () => {
-                    const ids = [];
-                    document.querySelectorAll('a[href*="/products/"][href*="/edit"]').forEach(link => {
-                        const m = link.href.match(/\\/products\\/(\\d+)\\/edit/);
-                        if(m) ids.push(m[1]);
-                    });
-                    document.querySelectorAll('[data-id]').forEach(el => {
-                        const id = el.getAttribute('data-id');
-                        if(id && /^\\d+$/.test(id)) ids.push(id);
-                    });
-                    document.querySelectorAll('[data-product-id]').forEach(el => {
-                        const id = el.getAttribute('data-product-id');
-                        if(id && /^\\d+$/.test(id)) ids.push(id);
-                    });
-                    return [...new Set(ids)];
-                }
-            """)
-            found_new_ids = False
-            for pid in ids_on_page:
-                if str(pid) not in all_ids:
-                    found_new_ids = True
-                all_ids.add(str(pid))
+            locator = page.locator(selector)
+            if locator.count() > 0:
+                button = locator.first
+                if button.is_visible():
+                    print(f"➡️  Navegando para página {current_page + 1}...")
+                    
+                    with page.expect_response(is_list_response, timeout=15000) as response_info:
+                        button.click()
+                    
+                    response = response_info.value
+                    data = response.json()
+                    
+                    if data.get("data"):
+                        page_ids = [str(item.get("id")) for item in data["data"] if item.get("id")]
+                        new_count = len([pid for pid in page_ids if pid not in all_ids])
+                        all_ids.update(page_ids)
+                        print(f"✓ Página {current_page + 1}: {len(page_ids)} produtos ({new_count} novos)")
+                        return True
+        except Exception:
+            continue
+    
+    return False
 
-            # se achou novos ids no DOM, resetar contador de attempts
-            if found_new_ids:
-                scroll_attempts = 0
-
-            if len(captured_responses) == previous_count and not ids_on_page:
-                print("[INFO] Sem novos dados após scroll/extracão DOM - finalizando paginação")
-                break
-            # se conseguirmos ids direto, continuar tentando scroll até estabilizar
-            # limite de segurança
-            if len(all_ids) > 0 and len(captured_responses) == 0:
-                # se nunca capturou via API mas tem ids DOM, adiciona um pseudo-captured set
-                captured_responses.append({"data": [{"id": pid} for pid in list(all_ids)]})
-        except Exception as e:
-            print(f"[WARN] extração DOM falhou: {e}")
-            break
-
-    # processa respostas api capturadas
-    for data in captured_responses:
-        for item in data.get("data", []):
-            pid = str(item.get("id"))
-            if pid:
-                all_ids.add(pid)
-
-    all_ids_list = sorted(list(all_ids))
-    print(f"Total de {len(all_ids_list)} produtos únicos capturados")
-    return [(pid, f"https://www.grasiely.com.br/admin/products/{pid}/edit") for pid in all_ids_list]
-
+def extract_ids_from_dom(page: Page, all_ids: set) -> bool:
+    """
+    Extrai IDs diretamente do DOM como fallback
+    Retorna True se encontrou novos IDs
+    """
+    try:
+        ids_on_page = page.evaluate("""
+            () => {
+                const ids = new Set();
+                
+                // Links de edição
+                document.querySelectorAll('a[href*="/products/"][href*="/edit"]').forEach(link => {
+                    const match = link.href.match(/\/products\/(\d+)\/edit/);
+                    if (match) ids.add(match[1]);
+                });
+                
+                // Atributos data-id
+                document.querySelectorAll('[data-id]').forEach(el => {
+                    const id = el.getAttribute('data-id');
+                    if (id && /^\d+$/.test(id)) ids.add(id);
+                });
+                
+                // Atributos data-product-id
+                document.querySelectorAll('[data-product-id]').forEach(el => {
+                    const id = el.getAttribute('data-product-id');
+                    if (id && /^\d+$/.test(id)) ids.add(id);
+                });
+                
+                return Array.from(ids);
+            }
+        """)
+        
+        new_ids = [pid for pid in ids_on_page if pid not in all_ids]
+        if new_ids:
+            all_ids.update(new_ids)
+            return True
+            
+    except Exception as e:
+        print(f"⚠️ Erro ao extrair IDs do DOM: {str(e)[:50]}")
+    
+    return False
 
 # =========================
-# 3) PROCESSA - agora com logs e tentativa de salvar via storage
+# 3) PROCESSA PRODUTOS COM CHECKPOINT
 # =========================
-def process_all_products(page: Page, edit_urls: list, storage, batch_size: int = 20) -> list:
+def process_all_products(page: Page, product_ids: List[str], storage) -> List[dict]:
+    """
+    Processa todos os produtos com tracking de progresso e salvamento em lote
+    """
+    tracker = ProgressTracker(len(product_ids))
     products = []
-    total = len(edit_urls)
-    errors = 0
     buffer = []
-
-    print(f"Iniciando processamento de {total} produtos...")
-    for idx, (pid, url) in enumerate(edit_urls, 1):
-        if idx % 50 == 0 or idx == 1:
-            print(f"Progresso: {idx}/{total} ({(idx/total)*100:.1f}%) | Erros: {errors}")
-
+    
+    print(f"\n📦 Processando {len(product_ids)} produtos...")
+    print(f"⚙️  Config: timeout={CONFIG.timeout_per_product}ms, retries={CONFIG.max_retries}, batch={CONFIG.batch_size}")
+    print()
+    
+    for idx, pid in enumerate(product_ids, 1):
+        # Log de progresso a cada 50 produtos
+        if idx % 50 == 0:
+            tracker._print_progress()
+        
         try:
             product = collect_product_data(page, pid)
-            if product.get("nome"):
+            
+            if product and product.get("nome"):
                 products.append(product)
                 buffer.append(product)
-                if len(buffer) >= batch_size:
-                    try:
-                        storage.save_many(buffer)
-                    except AttributeError:
-                        for p in buffer:
-                            try:
-                                storage.save(p)
-                            except Exception:
-                                pass
+                tracker.log_success(pid, product.get("nome", ""))
+                
+                # Salva em lote
+                if len(buffer) >= CONFIG.batch_size:
+                    save_batch(storage, buffer)
                     buffer = []
-                if idx % 10 == 0:
-                    print(f"✓ {idx}: {pid} - {product.get('nome', 'N/A')[:40]}")
             else:
-                errors += 1
-                print(f"⚠️ {idx}: {pid} - SEM DADOS")
+                tracker.log_failure(pid, "Sem dados após retries")
+                
         except Exception as e:
-            errors += 1
-            print(f"❌ {idx}: {pid} - ERRO: {str(e)[:80]}")
-
-    # salva o buffer restante
+            tracker.log_failure(pid, str(e))
+    
+    # Salva resto do buffer
     if buffer:
-        try:
-            storage.save_many(buffer)
-        except AttributeError:
-            for p in buffer:
-                try:
-                    storage.save(p)
-                except Exception:
-                    pass
-
-    print(f"Processamento concluído: {len(products)} produtos salvos | {errors} erros")
+        save_batch(storage, buffer)
+    
+    # Resumo final
+    tracker.print_summary()
+    
+    # Salva lista de IDs que falharam
+    if tracker.failed_ids:
+        save_failed_ids(tracker.failed_ids)
+    
     return products
 
+def save_batch(storage, products: List[dict]):
+    """Salva um lote de produtos, com fallback para salvamento individual"""
+    try:
+        if hasattr(storage, 'save_many'):
+            storage.save_many(products)
+        else:
+            for product in products:
+                try:
+                    storage.save(product)
+                except Exception as e:
+                    print(f"⚠️ Erro ao salvar {product.get('produto_id')}: {str(e)[:40]}")
+    except Exception as e:
+        print(f"⚠️ Erro no salvamento em lote: {str(e)[:60]}")
+        # Tenta salvar individualmente
+        for product in products:
+            try:
+                storage.save(product)
+            except:
+                pass
+
+def save_failed_ids(failed_ids: List[str]):
+    """Salva lista de IDs que falharam para reprocessamento posterior"""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"/home/claude/failed_products_{timestamp}.json"
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump({
+                "timestamp": timestamp,
+                "count": len(failed_ids),
+                "ids": failed_ids
+            }, f, indent=2, ensure_ascii=False)
+        
+        print(f"\n💾 IDs que falharam salvos em: {filename}")
+    except Exception as e:
+        print(f"⚠️ Não foi possível salvar lista de falhas: {str(e)}")
 
 # =========================
-# 4) PRINCIPAL (exposição pública)
+# 4) FUNÇÃO PRINCIPAL
 # =========================
-def collect_all_products(page: Page, storage) -> list:
-    base_list_url = "https://www.grasiely.com.br/admin/products/list?sort=name&page[size]=25&page[number]=1"
-
-    print("\nETAPA 1: COLETANDO IDS DOS PRODUTOS")
-    edit_urls = collect_all_edit_urls(page, base_list_url)
-
-    # Limite para teste rápido: só 5 produtos
-    edit_urls = edit_urls[:5]  # <-- comentário: limitar coleta para teste rápido
-
-    if not edit_urls:
-        print("⚠️ Nenhum produto foi capturado!")
+def collect_all_products(page: Page, storage) -> List[dict]:
+    """
+    Função principal que orquestra toda a coleta
+    """
+    base_list_url = (
+        f"https://www.grasiely.com.br/admin/products/list?"
+        f"sort=name&page[size]={CONFIG.page_size}&page[number]=1"
+    )
+    
+    print("\n" + "="*60)
+    print("INICIANDO COLETA DE PRODUTOS")
+    print("="*60)
+    print(f"URL base: {base_list_url}")
+    print(f"Configurações: {CONFIG}")
+    print("="*60 + "\n")
+    
+    # ETAPA 1: Coletar IDs
+    print("📋 ETAPA 1: COLETANDO IDS DOS PRODUTOS")
+    print("-" * 60)
+    product_ids = collect_all_product_ids(page, base_list_url)
+    
+    if not product_ids:
+        print("❌ Nenhum produto foi encontrado!")
         return []
-
-    print("\nETAPA 2: COLETANDO DADOS DETALHADOS")
-    all_products = process_all_products(page, edit_urls, storage,batch_size=1)
-
-    print("\nCONCLUÍDO")
-    print(f"Total encontrado: {len(edit_urls)} produtos")
-    print(f"Total coletado: {len(all_products)} produtos")
-    print(f"Falhas: {len(edit_urls) - len(all_products)}")
+    
+    # Descomente para testar com poucos produtos
+    # product_ids = product_ids[:10]
+    # print(f"⚠️  MODO TESTE: Processando apenas {len(product_ids)} produtos")
+    
+    # ETAPA 2: Coletar dados detalhados
+    print("\n📦 ETAPA 2: COLETANDO DADOS DETALHADOS")
+    print("-" * 60)
+    all_products = process_all_products(page, product_ids, storage)
+    
+    # Resumo final
+    print("\n" + "="*60)
+    print("✅ COLETA CONCLUÍDA")
+    print("="*60)
+    print(f"IDs encontrados: {len(product_ids)}")
+    print(f"Produtos coletados: {len(all_products)}")
+    print(f"Taxa de sucesso: {len(all_products)/len(product_ids)*100:.1f}%")
+    print("="*60 + "\n")
+    
     return all_products
+
+# =========================
+# 5) FUNÇÃO PARA REPROCESSAR FALHAS
+# =========================
+def retry_failed_products(page: Page, storage, failed_json_path: str) -> List[dict]:
+    """
+    Reprocessa produtos que falharam na execução anterior
+    """
+    try:
+        with open(failed_json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        failed_ids = data.get("ids", [])
+        print(f"🔄 Reprocessando {len(failed_ids)} produtos que falharam anteriormente...")
+        
+        return process_all_products(page, failed_ids, storage)
+        
+    except Exception as e:
+        print(f"❌ Erro ao carregar arquivo de falhas: {str(e)}")
+        return []
