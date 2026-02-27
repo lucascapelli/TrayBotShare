@@ -1,8 +1,9 @@
 # auth.py
-
 import os
 import json
-from playwright.sync_api import Page
+import random
+import time
+from patchright.sync_api import Page  # ← TROQUEI AQUI
 
 
 def find_existing(path_options):
@@ -14,7 +15,6 @@ def find_existing(path_options):
 
 def normalize_cookies(raw_cookies):
     cleaned = []
-
     for c in raw_cookies:
         cookie = {
             "name": c["name"],
@@ -42,7 +42,6 @@ def normalize_cookies(raw_cookies):
                 cookie["sameSite"] = "None"
 
         cleaned.append(cookie)
-
     return cleaned
 
 
@@ -55,26 +54,42 @@ def load_cookies(context, cookie_files):
         raw = json.load(f)
 
     cookies = normalize_cookies(raw)
-    context.add_cookies(cookies)
-
+    try:
+        context.add_cookies(cookies)
+    except Exception:
+        pass
     return cookie_path
 
 
 def save_cookies(context, filepath):
-    cookies = context.cookies()
+    try:
+        cookies = context.cookies()
+    except Exception:
+        cookies = []
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(cookies, f, indent=2, ensure_ascii=False)
 
 
 def needs_login(page: Page):
     try:
-        return (
-            "login" in page.url.lower()
-            or page.locator("#usuario").count() > 0
-            or page.locator("input[type='password']").count() > 0
-        )
+        url = page.url.lower()
+        if "login" in url or "entrar" in url:
+            return True
+        if page.locator("#usuario, input[type='email'], input[name='username']").count() > 0:
+            return True
+        if page.locator("input[type='password']").count() > 0:
+            return True
+        return False
     except Exception:
         return False
+
+
+def human_type(page, selector, text):
+    locator = page.locator(selector)
+    locator.click()
+    for char in text:
+        locator.press(char)
+        time.sleep(random.uniform(0.07, 0.18))
 
 
 def login_if_needed(context, page: Page, username, password, cookie_save_path=None):
@@ -84,31 +99,40 @@ def login_if_needed(context, page: Page, username, password, cookie_save_path=No
     if not username or not password:
         return False
 
-    page.wait_for_selector("#usuario", timeout=15000)
-    page.wait_for_selector("#senha", timeout=15000)
+    # espera campos
+    page.wait_for_selector("#usuario, input[type='email'], input[name='username']", timeout=15000)
+    page.wait_for_selector("#senha, input[type='password']", timeout=15000)
 
-    page.locator("#usuario").fill(username)
-    page.locator("#senha").fill(password)
+    # mouse humano
+    page.mouse.move(random.randint(150, 800), random.randint(100, 600), steps=18)
 
-    submit = page.locator(
-        "button[type='submit'], input[type='submit'], .btn-login, .login-button"
-    )
+    # digitação humana (Tray detecta fill rápido)
+    if page.locator("#usuario").count() > 0:
+        human_type(page, "#usuario", username)
+    else:
+        human_type(page, "input[type='email'], input[name='username']", username)
 
+    time.sleep(random.uniform(0.8, 1.6))
+    human_type(page, "#senha, input[type='password']", password)
+
+    time.sleep(random.uniform(1.2, 2.5))
+
+    # submit
+    submit = page.locator("button[type='submit'], input[type='submit'], .btn-login")
     if submit.count() > 0:
         submit.first.click()
     else:
-        page.locator("#senha").press("Enter")
+        page.keyboard.press("Enter")
 
-    page.wait_for_timeout(5000)
+    page.wait_for_timeout(random.randint(4000, 6500))
 
-    # OTP detection
+    # OTP
     if page.locator("#code").count() > 0:
         code = input("Digite o código OTP: ").strip()
         page.locator("#code").fill(code)
         page.locator("#code").press("Enter")
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(4000)
 
-    # validação pós login
     if needs_login(page):
         return False
 
@@ -122,21 +146,24 @@ def authenticate(context, url, username, password, cookie_files):
     cookie_path = load_cookies(context, cookie_files)
 
     page = context.new_page()
-    page.goto(url)
-    page.wait_for_load_state("networkidle")
+
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    except Exception:
+        page.goto(url, timeout=90000)
+
+    page.wait_for_load_state("networkidle", timeout=15000)
 
     save_path = cookie_path or cookie_files[0]
 
-    ok = login_if_needed(
-        context,
-        page,
-        username,
-        password,
-        cookie_save_path=save_path
-    )
+    ok = login_if_needed(context, page, username, password, cookie_save_path=save_path)
 
     if not ok:
         page.close()
         return None
+
+    # movimento humano extra (evita "Loja bloqueada")
+    page.wait_for_timeout(random.randint(3500, 6000))
+    page.mouse.move(random.randint(400, 1200), random.randint(300, 800), steps=25)
 
     return page
