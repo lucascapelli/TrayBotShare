@@ -2,14 +2,14 @@
 import os
 import random
 from dotenv import load_dotenv
-from patchright.sync_api import sync_playwright  # ← TROQUEI AQUI
+from patchright.sync_api import sync_playwright
 from service.auth import authenticate
 from service.scraper import collect_all_products
-from service import storage
+from service.storage import storage
 
 load_dotenv()
 
-HEADLESS = True   # ← pode voltar para True agora
+HEADLESS = True
 
 ORIGEM_URL = os.getenv("ORIGEM_URL")
 SOURCE_USER = os.getenv("SOURCE_USER")
@@ -23,10 +23,14 @@ COOKIES_ORIGEM_FILES = [
 
 
 def main():
+    print("=" * 60)
+    print("🤖 TRAY BOT - SCRAPER DE PRODUTOS")
+    print("=" * 60)
+    
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=HEADLESS,
-            channel="chrome",   # usa Chrome real (mais stealth)
+            channel="chrome",
             args=[
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
@@ -42,6 +46,9 @@ def main():
             timezone_id="America/Sao_Paulo"
         )
 
+        print("\n📋 ETAPA 1: AUTENTICAÇÃO")
+        print("-" * 60)
+        
         origem_page = authenticate(
             context,
             ORIGEM_URL,
@@ -51,23 +58,45 @@ def main():
         )
 
         if not origem_page:
-            print("❌ Falha na autenticação da origem")
+            print("\n❌ FALHA CRÍTICA: Não foi possível autenticar")
             browser.close()
             return
 
-        print("✅ Origem autenticada com sucesso!")
-
+        print("\n📋 ETAPA 2: COLETA DE PRODUTOS")
+        print("-" * 60)
+        
         origin_products = collect_all_products(origem_page, storage)
 
-        print(f"\nTotal coletado: {len(origin_products)} produtos")
-        print("\n===== RESULTADO FINAL =====")
+        if len(origin_products) == 0:
+            print("\n⚠️ AVISO: Nenhum produto foi coletado!")
+            origem_page.close()
+            browser.close()
+            return
 
-        for product in origin_products:
-            print("---------------")
-            for k, v in product.items():
-                print(f"{k}: {v}")
+        print("\n" + "=" * 60)
+        print("🎉 PROCESSO FINALIZADO")
+        print(f"📦 Total de produtos coletados: {len(origin_products)}")
+        print("=" * 60)
+        
+        # Exibe estatísticas
+        stats = storage.get_statistics()
+        print("\n📊 ESTATÍSTICAS:")
+        print(f"  • Total de produtos: {stats['total']}")
+        print(f"  • Com preço: {stats['com_preco']}")
+        print(f"  • Com estoque: {stats['com_estoque']}")
+        print(f"\n  Top 5 Categorias:")
+        for cat, count in stats.get('top_5_categorias', []):
+            print(f"    - {cat}: {count} produtos")
+        
+        print(f"\n💾 Dados salvos em: produtos/ProdutosOrigem.json")
+        
+        # Exportar CSV
+        try:
+            storage.export_csv("produtos/ProdutosOrigem.csv")
+            print(f"📊 CSV exportado para: produtos/ProdutosOrigem.csv")
+        except Exception as e:
+            print(f"⚠️ Erro ao exportar CSV: {e}")
 
-        # FECHA SÓ NO FINAL (bug corrigido)
         origem_page.close()
         browser.close()
 

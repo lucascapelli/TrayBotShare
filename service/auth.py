@@ -144,26 +144,34 @@ def login_if_needed(context, page: Page, username, password, cookie_save_path=No
 
 def authenticate(context, url, username, password, cookie_files):
     cookie_path = load_cookies(context, cookie_files)
-
     page = context.new_page()
 
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=45000)
-    except Exception:
-        page.goto(url, timeout=90000)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        except Exception:
+            page.goto(url, timeout=90000)
 
-    page.wait_for_load_state("networkidle", timeout=15000)
+        page.wait_for_load_state("networkidle", timeout=15000)
 
-    save_path = cookie_path or cookie_files[0]
+        save_path = cookie_path or cookie_files[0]
 
-    ok = login_if_needed(context, page, username, password, cookie_save_path=save_path)
+        ok = login_if_needed(context, page, username, password, cookie_save_path=save_path)
 
-    if not ok:
-        page.close()
+        if not ok:
+            print("\n[ERRO] Falha no login. Navegador pausado para análise.")
+            input("Pressione ENTER para encerrar...")
+            return None
+
+        page.wait_for_timeout(random.randint(3500, 6000))
+        page.mouse.move(random.randint(400, 1200), random.randint(300, 800), steps=25)
+
+        return page
+
+    except Exception as e:
+        print("\n[ERRO INESPERADO]")
+        print(type(e).__name__, "-", str(e))
+        print("Execução pausada. Analise o navegador aberto.")
+        input("Pressione ENTER para encerrar...")
+
         return None
-
-    # movimento humano extra (evita "Loja bloqueada")
-    page.wait_for_timeout(random.randint(3500, 6000))
-    page.mouse.move(random.randint(400, 1200), random.randint(300, 800), steps=25)
-
-    return page

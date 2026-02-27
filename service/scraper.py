@@ -1,265 +1,343 @@
-# service/scraper.py
-
 import re
-from urllib.parse import urljoin
-from patchright.sync_api import Page, TimeoutError
-import random
+import json
 import time
+from urllib.parse import urljoin
+from patchright.sync_api import Page
+from typing import List, Tuple
 
 # =========================
-# 1) COLETA (TELA ABERTA NA PÁGINA DE EDIÇÃO)
+# 1) COLETA DO JSON DA EDIÇÃO - COM espera explícita e retry
 # =========================
-def collect_product_data(page: Page, produto_id: str) -> dict:
+def collect_product_data(page: Page, produto_id: str, timeout: int = 15000) -> dict:
     """
-    Assume: já estamos na página de edição do produto.
-    produto_id: id numérico extraído da URL (ex: "3307")
+    Captura o JSON de detalhe do produto usando um response listener (modo antigo, mais robusto).
+    timeout em ms.
     """
     product = {"produto_id": produto_id}
+    detail_json = None
 
-    def log(field, value):
-        print(f"[COLETA] {field}: {value}")
+    def handle_response(response):
+        nonlocal detail_json
+        # se já capturamos, ignora
+        if detail_json:
+            return
+        try:
+            ct = response.headers.get("content-type", "")
+            if "application/json" not in ct:
+                return
+            data = response.json()
+            if isinstance(data, dict) and "data" in data:
+                rid = data["data"].get("id")
+                if rid is None:
+                    return
+                if str(rid) == str(produto_id):
+                    detail_json = data["data"]
+                    print(f"✅ JSON DETALHE CAPTURADO para {produto_id}")
+        except Exception:
+            # silencioso — não queremos quebrar por causa de um response malformado
+            return
 
-    # Referência textual
+    page.on("response", handle_response)
+
     try:
-        ref_loc = page.locator(r"text=/Ref\.\s*(.+)/").first
-        ref_text = ref_loc.inner_text(timeout=5000).strip()
-        product["referencia"] = ref_text.replace("Ref.", "").strip()
-    except:
-        product["referencia"] = None
-    log("referencia", product["referencia"])
-
-    # Espera tela de edição
-    try:
-        page.wait_for_selector(
-            "div.product-info-detail:has(h4:has-text('Nome do produto')) input[type='text']",
-            timeout=15000
-        )
-    except TimeoutError:
+        # navega (networkidle costuma garantir que as chamadas XHR acabem, mas mantemos o listener)
+        page.goto(f"https://www.grasiely.com.br/admin/products/{produto_id}/edit",
+                  wait_until="networkidle", timeout=timeout)
+    except Exception:
+        # podemos ignorar timeout aqui porque o listener ainda pode capturar a resposta
         pass
 
-    # NOME
-    try:
-        name_input = page.locator(
-            "div.product-info-detail:has(h4:has-text('Nome do produto')) input[type='text']"
-        )
-        product["nome"] = name_input.input_value(timeout=5000)
-    except:
-        product["nome"] = None
-    log("nome", product["nome"])
+    # polling curto até timeout
+    waited = 0
+    interval = 250  # ms
+    while detail_json is None and waited < timeout:
+        page.wait_for_timeout(interval)
+        waited += interval
 
-    # IMAGEM
-    try:
-        img = page.get_by_role("img").first
-        product["imagem_url"] = img.get_attribute("src", timeout=5000)
-    except:
-        product["imagem_url"] = None
-    log("imagem_url", product["imagem_url"])
+    page.remove_listener("response", handle_response)
 
-    # CATEGORIA
-    try:
-        categoria_btn = page.get_by_role("button", name=re.compile(r".+"))
-        product["categoria"] = categoria_btn.first.inner_text(timeout=5000).strip()
-    except:
-        product["categoria"] = None
-    log("categoria", product["categoria"])
+    if not detail_json:
+        print(f"⚠️ Timeout/erro no produto {produto_id}: não capturou JSON em {timeout}ms")
+        return product
 
-    # DESCRIÇÃO (iframe editor1)
-    try:
-        iframe = page.frame_locator("iframe[title='Editor de Rich Text, editor1']")
-        product["descricao"] = iframe.locator("body").inner_text(timeout=8000)
-    except:
-        product["descricao"] = None
-    log("descricao", product["descricao"])
-
-    # SEO preview
-    try:
-        seo = page.locator(".product-seo > .product-seo__preview")
-        product["seo_preview"] = seo.inner_text(timeout=5000)
-    except:
-        product["seo_preview"] = None
-    log("seo_preview", product["seo_preview"])
-
-    # PREÇO
-    try:
-        product["preco"] = (
-            page.get_by_role("group", name="Preço de venda")
-            .get_by_placeholder("0,00")
-            .input_value(timeout=5000)
-        )
-    except:
-        product["preco"] = None
-    log("preco", product["preco"])
-
-    # ESTOQUE / ESTOQUE MÍNIMO
-    def safe_group_value(group_name, placeholder="0"):
-        try:
-            return page.get_by_role("group", name=group_name).get_by_placeholder(placeholder).input_value(timeout=5000)
-        except:
-            return None
-
-    product["estoque"] = safe_group_value("Estoque", "0")
-    log("estoque", product["estoque"])
-
-    product["estoque_minimo"] = safe_group_value("Estoque mínimo", "0")
-    log("estoque_minimo", product["estoque_minimo"])
-
-    # CHECKBOX NOTIFICAÇÃO
-    try:
-        label = page.locator("label:has-text('Notificação de estoque baixo')")
-        checkbox_id = label.get_attribute("for", timeout=5000)
-        if checkbox_id:
-            product["notificacao_estoque_baixo"] = page.locator(f"#{checkbox_id}").is_checked(timeout=5000)
-        else:
-            product["notificacao_estoque_baixo"] = False
-    except:
-        product["notificacao_estoque_baixo"] = False
-    log("notificacao_estoque_baixo", product["notificacao_estoque_baixo"])
-
-    # REFERÊNCIA PERSONALIZADA
-    try:
-        product["referencia_personalizada"] = page.get_by_role("textbox", name="Ex: REF-").input_value(timeout=5000)
-    except:
-        product["referencia_personalizada"] = None
-    log("referencia_personalizada", product["referencia_personalizada"])
-
-    # DIMENSÕES
-    product["peso"] = safe_group_value("Peso", "0")
-    log("peso", product["peso"])
-
-    product["altura"] = safe_group_value("Altura", "0")
-    log("altura", product["altura"])
-
-    product["largura"] = safe_group_value("Largura", "0")
-    log("largura", product["largura"])
-
-    product["comprimento"] = safe_group_value("Comprimento", "0")
-    log("comprimento", product["comprimento"])
-
-    # GARANTIA
-    try:
-        garantia_group = page.get_by_role("group", name="Tempo de garantia")
-        product["tempo_garantia"] = garantia_group.inner_text(timeout=5000)
-    except:
-        product["tempo_garantia"] = None
-    log("tempo_garantia", product["tempo_garantia"])
-
-    try:
-        product["tempo_garantia_personalizado"] = page.get_by_role("textbox", name="Descreva o tempo de garantia").input_value(timeout=5000)
-    except:
-        product["tempo_garantia_personalizado"] = None
-    log("tempo_garantia_personalizado", product["tempo_garantia_personalizado"])
-
-    # ITENS INCLUSOS / MENSAGEM ADICIONAL
-    try:
-        itens_boxes = page.get_by_role("textbox", name="Ex: 1 adesivo")
-        if itens_boxes.count() >= 1:
-            product["itens_inclusos"] = itens_boxes.nth(0).input_value(timeout=5000)
-        if itens_boxes.count() >= 2:
-            product["mensagem_adicional"] = itens_boxes.nth(1).input_value(timeout=5000)
-    except:
-        product["itens_inclusos"] = None
-        product["mensagem_adicional"] = None
-    log("itens_inclusos", product["itens_inclusos"])
-    log("mensagem_adicional", product["mensagem_adicional"])
-
+    d = detail_json
+    product.update({
+        "nome": d.get("name"),
+        "preco": float(d.get("price", "0").replace(",", ".")) if d.get("price") else None,
+        "descricao": d.get("description"),
+        "estoque": d.get("stock"),
+        "estoque_minimo": d.get("minimum_stock"),
+        "categoria": d.get("category_name"),
+        "referencia": d.get("reference"),
+        "peso": d.get("weight"),
+        "altura": d.get("height"),
+        "largura": d.get("width"),
+        "comprimento": d.get("length"),
+        "imagem_url": (d.get("ProductImage") or [{}])[0].get("https") if d.get("ProductImage") else None,
+        "notificacao_estoque_baixo": d.get("minimum_stock_alert") == "1",
+        "itens_inclusos": d.get("included_items"),
+        "mensagem_adicional": d.get("additional_message"),
+        "tempo_garantia": d.get("warranty"),
+        "seo_preview": {
+            "link": (d.get("url") or {}).get("https"),
+            "title": next((m.get("content") for m in d.get("metatag", []) if m.get("type") == "title"), None),
+            "description": next((m.get("content") for m in d.get("metatag", []) if m.get("type") == "description"), None)
+        }
+    })
     return product
 
+# =========================
+# 2) CAPTURA IDS - PAGINAÇÃO ROBUSTA (com limite de tentativas de scroll)
+# =========================
+def collect_all_edit_urls(page: Page, base_list_url: str) -> List[Tuple[str, str]]:
+    """
+    Tenta interceptar respostas de listagem paginada. Usa:
+     • expect_response para a primeira página
+     • tentativa de clicar botão 'next' via vários seletores
+     • fallback para scroll infinito/dom extraction se necessário
+    Retorna lista de (produto_id, url_edit).
+    """
+    all_ids = set()
+    captured_responses = []
 
-# =========================
-# 2) COLETA TODOS OS EDIT_URLS (PAGINAÇÃO COMPLETA PRIMEIRO)
-# =========================
-def collect_all_edit_urls(page: Page, base_list_url: str) -> list[tuple[str, str]]:
-    all_edit_urls = []
-    seen_ids = set()
+    def is_list_response(response):
+        try:
+            return ("products-search" in response.url or "/api/products" in response.url) \
+                   and response.status == 200 \
+                   and "application/json" in response.headers.get("content-type", "")
+        except:
+            return False
+
+    print("Iniciando coleta via interceptação com paginação...")
+    # captura primeira página
+    try:
+        with page.expect_response(is_list_response, timeout=10000) as r:
+            page.goto(base_list_url, wait_until="networkidle", timeout=30000)
+        response = r.value
+        data = response.json()
+        if data.get("data"):
+            captured_responses.append(data)
+            print(f"Página 1: {len(data['data'])} produtos")
+    except Exception as e:
+        print(f"⚠️ Não capturou resposta da primeira página: {e}")
+        # continua para tentar extrair via DOM
+
+    max_pages = 300
     current_page = 1
 
-    while True:
-        print(f"[PAGINAÇÃO] Processando página {current_page}...")
+    # novo: contador de tentativas de fallback (scroll/extraction)
+    scroll_attempts = 0
+    max_scroll_attempts = 15  # <-- máximo de vezes que imprimirá o fallback antes de desistir
 
-        # Locator mais específico: só links na tabela de produtos (ajuste class se precisar)
-        anchors = page.locator("table tbody tr a[href*='/admin/products/']")  # Ou ".table-products tbody tr a" se tiver class
-        total_anchors = anchors.count()
-        hrefs = []
-        for i in range(total_anchors):
+    while current_page < max_pages:
+        # tentativa de localizar botão next por várias estratégias
+        clicked = False
+        try:
+            # 1) tentativa por aria/role
             try:
-                href = anchors.nth(i).get_attribute("href", timeout=5000)
-                if href:
-                    hrefs.append(href)
+                next_btn = page.get_by_role("button", name=re.compile(r"next|próxima|>',',',", re.I))
             except:
-                continue
+                next_btn = None
+            # 2) seletor comum
+            selectors = [
+                "a.next:not(.disabled)",
+                "button.next:not([disabled])",
+                ".pagination a[rel='next']:not(.disabled)",
+                "a[aria-label*='next']:not([aria-disabled='true'])",
+                "button[aria-label*='next']:not([aria-disabled='true'])",
+                "a:has-text('Próxima'):not(.disabled)",
+                "a:has-text('Next'):not(.disabled)",
+            ]
+            # try role-based click first if exists and visible
+            if next_btn and getattr(next_btn, "count", lambda: 1)() > 0:
+                try:
+                    if next_btn.is_visible():
+                        current_page += 1
+                        print(f"Ir para página {current_page} (role click)...")
+                        with page.expect_response(is_list_response, timeout=15000) as r:
+                            next_btn.click()
+                        response = r.value
+                        data = response.json()
+                        if data.get("data"):
+                            captured_responses.append(data)
+                            print(f"Página {current_page}: {len(data['data'])} produtos")
+                            clicked = True
+                            scroll_attempts = 0
+                            continue
+                except Exception:
+                    pass
 
-        # Print debug: primeiros 3 hrefs (comente depois)
-        print(f"[DEBUG] Primeiros hrefs encontrados: {hrefs[:3]}")
-
-        for href in hrefs:
-            m = re.search(r"/admin/products/(\d+)(?:/edit)?", href)
-            if m:
-                produto_id = m.group(1)
-                if produto_id in seen_ids:
+            # try selectors
+            for sel in selectors:
+                try:
+                    locator = page.locator(sel)
+                    if locator.count() > 0:
+                        loc = locator.first
+                        if loc.is_visible():
+                            current_page += 1
+                            print(f"Ir para página {current_page} (selector '{sel}')...")
+                            with page.expect_response(is_list_response, timeout=15000) as r:
+                                loc.click()
+                            response = r.value
+                            data = response.json()
+                            if data.get("data"):
+                                captured_responses.append(data)
+                                print(f"Página {current_page}: {len(data['data'])} produtos")
+                            clicked = True
+                            scroll_attempts = 0
+                            break
+                except Exception:
                     continue
-                seen_ids.add(produto_id)
-                full_url = urljoin(base_list_url, f"/admin/products/{produto_id}/edit")
-                all_edit_urls.append((produto_id, full_url))
-
-        print(f"[PAGINAÇÃO] Encontrados {len(hrefs)} links válidos na página {current_page}. Total únicos até agora: {len(all_edit_urls)}")
-
-        # Próxima página
-        next_button = page.get_by_role("menuitem", name="Go to next page")
-        if next_button.count() == 0 or not next_button.is_enabled():
-            print("[PAGINAÇÃO] Sem próxima página. Coleta de URLs completa.")
-            break
-
-        next_button.click()
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=20000)
-            # time.sleep(random.uniform(1.0, 2.5))  # Delay humano (ative se der bloqueio)
-        except:
-            break
-
-        current_page += 1
-
-    return all_edit_urls
-
-
-# =========================
-# 3) PROCESSA TODOS OS PRODUTOS (SEM VOLTA PRA LISTAGEM)
-# =========================
-def process_all_products(page: Page, edit_urls: list[tuple[str, str]], storage) -> list[dict]:
-    products = []
-
-    for idx, (produto_id, edit_url) in enumerate(edit_urls, 1):
-        print(f"[PROCESSO] {idx}/{len(edit_urls)} - Indo para edição: {produto_id} -> {edit_url}")
-
-        try:
-            page.goto(edit_url)
-            page.wait_for_load_state("domcontentloaded", timeout=20000)
-            # time.sleep(random.uniform(0.5, 1.5))  # Delay humano opcional
         except Exception as e:
-            print(f"[ERRO] Falha ao ir para {edit_url}: {e}")
+            print(f"[WARN] Erro ao tentar localizar/clicar next: {e}")
+
+        if clicked:
+            # continue paginando
             continue
 
-        try:
-            product = collect_product_data(page, produto_id)
-            products.append(product)
-            storage.save(product)  # Ajuste para storage.save_product(product) se for o caso
-        except Exception as e:
-            print(f"[ERRO] Coleta falhou para {produto_id}: {e}")
+        # fallback: scroll infinito / extrair mais do DOM
+        scroll_attempts += 1
+        if scroll_attempts > max_scroll_attempts:
+            print(f"[INFO] Alcançado máximo de {max_scroll_attempts} tentativas de scroll/extracão - finalizando paginação")
+            break
 
+        print(f"[INFO] ({scroll_attempts}/{max_scroll_attempts}) Sem botão next ou clique falhou. Tentando scroll / extração DOM...")
+        previous_count = len(captured_responses)
+        # força scroll para tentar acionar APIs
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+        # tenta extrair via JS os ids que já estão no DOM
+        try:
+            ids_on_page = page.evaluate("""
+                () => {
+                    const ids = [];
+                    document.querySelectorAll('a[href*="/products/"][href*="/edit"]').forEach(link => {
+                        const m = link.href.match(/\\/products\\/(\\d+)\\/edit/);
+                        if(m) ids.push(m[1]);
+                    });
+                    document.querySelectorAll('[data-id]').forEach(el => {
+                        const id = el.getAttribute('data-id');
+                        if(id && /^\\d+$/.test(id)) ids.push(id);
+                    });
+                    document.querySelectorAll('[data-product-id]').forEach(el => {
+                        const id = el.getAttribute('data-product-id');
+                        if(id && /^\\d+$/.test(id)) ids.push(id);
+                    });
+                    return [...new Set(ids)];
+                }
+            """)
+            found_new_ids = False
+            for pid in ids_on_page:
+                if str(pid) not in all_ids:
+                    found_new_ids = True
+                all_ids.add(str(pid))
+
+            # se achou novos ids no DOM, resetar contador de attempts
+            if found_new_ids:
+                scroll_attempts = 0
+
+            if len(captured_responses) == previous_count and not ids_on_page:
+                print("[INFO] Sem novos dados após scroll/extracão DOM - finalizando paginação")
+                break
+            # se conseguirmos ids direto, continuar tentando scroll até estabilizar
+            # limite de segurança
+            if len(all_ids) > 0 and len(captured_responses) == 0:
+                # se nunca capturou via API mas tem ids DOM, adiciona um pseudo-captured set
+                captured_responses.append({"data": [{"id": pid} for pid in list(all_ids)]})
+        except Exception as e:
+            print(f"[WARN] extração DOM falhou: {e}")
+            break
+
+    # processa respostas api capturadas
+    for data in captured_responses:
+        for item in data.get("data", []):
+            pid = str(item.get("id"))
+            if pid:
+                all_ids.add(pid)
+
+    all_ids_list = sorted(list(all_ids))
+    print(f"Total de {len(all_ids_list)} produtos únicos capturados")
+    return [(pid, f"https://www.grasiely.com.br/admin/products/{pid}/edit") for pid in all_ids_list]
+
+
+# =========================
+# 3) PROCESSA - agora com logs e tentativa de salvar via storage
+# =========================
+def process_all_products(page: Page, edit_urls: list, storage, batch_size: int = 20) -> list:
+    products = []
+    total = len(edit_urls)
+    errors = 0
+    buffer = []
+
+    print(f"Iniciando processamento de {total} produtos...")
+    for idx, (pid, url) in enumerate(edit_urls, 1):
+        if idx % 50 == 0 or idx == 1:
+            print(f"Progresso: {idx}/{total} ({(idx/total)*100:.1f}%) | Erros: {errors}")
+
+        try:
+            product = collect_product_data(page, pid)
+            if product.get("nome"):
+                products.append(product)
+                buffer.append(product)
+                if len(buffer) >= batch_size:
+                    try:
+                        storage.save_many(buffer)
+                    except AttributeError:
+                        for p in buffer:
+                            try:
+                                storage.save(p)
+                            except Exception:
+                                pass
+                    buffer = []
+                if idx % 10 == 0:
+                    print(f"✓ {idx}: {pid} - {product.get('nome', 'N/A')[:40]}")
+            else:
+                errors += 1
+                print(f"⚠️ {idx}: {pid} - SEM DADOS")
+        except Exception as e:
+            errors += 1
+            print(f"❌ {idx}: {pid} - ERRO: {str(e)[:80]}")
+
+    # salva o buffer restante
+    if buffer:
+        try:
+            storage.save_many(buffer)
+        except AttributeError:
+            for p in buffer:
+                try:
+                    storage.save(p)
+                except Exception:
+                    pass
+
+    print(f"Processamento concluído: {len(products)} produtos salvos | {errors} erros")
     return products
 
 
 # =========================
-# 4) FUNÇÃO PRINCIPAL (CHAMADA NO MAIN)
+# 4) PRINCIPAL (exposição pública)
 # =========================
-def collect_all_products(page: Page, storage) -> list[dict]:
-    base_list_url = page.url
+def collect_all_products(page: Page, storage) -> list:
+    base_list_url = "https://www.grasiely.com.br/admin/products/list?sort=name&page[size]=25&page[number]=1"
 
-    # Passo 1: Coleta todos os edit_urls paginando
+    print("\nETAPA 1: COLETANDO IDS DOS PRODUTOS")
     edit_urls = collect_all_edit_urls(page, base_list_url)
 
-    # Passo 2: Processa todos os produtos
-    all_products = process_all_products(page, edit_urls, storage)
+    # Limite para teste rápido: só 5 produtos
+    edit_urls = edit_urls[:5]  # <-- comentário: limitar coleta para teste rápido
 
-    print(f"[FIM] Total de produtos coletados: {len(all_products)}")
+    if not edit_urls:
+        print("⚠️ Nenhum produto foi capturado!")
+        return []
 
+    print("\nETAPA 2: COLETANDO DADOS DETALHADOS")
+    all_products = process_all_products(page, edit_urls, storage,batch_size=1)
+
+    print("\nCONCLUÍDO")
+    print(f"Total encontrado: {len(edit_urls)} produtos")
+    print(f"Total coletado: {len(all_products)} produtos")
+    print(f"Falhas: {len(edit_urls) - len(all_products)}")
     return all_products
