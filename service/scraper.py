@@ -33,15 +33,18 @@ def collect_product_data(page: Page) -> dict:
 
     edit_link.click()
 
-    # ESPERA ELEMENTO REAL DA TELA (NÃO networkidle)
-    name_input = page.get_by_role(
-        "textbox",
-        name="Camiseta de manga longa"
+    # ========================
+    # 3) ESPERA TELA DE EDIÇÃO
+    # ========================
+
+    name_input = page.locator(
+        "div.product-info-detail:has(h4:has-text('Nome do produto')) input[type='text']"
     )
+
     name_input.wait_for(timeout=20000)
 
     # ========================
-    # 3) TELA DE EDIÇÃO
+    # 4) COLETA DADOS
     # ========================
 
     # NOME
@@ -61,7 +64,7 @@ def collect_product_data(page: Page) -> dict:
     product["categoria"] = categoria_btn.inner_text().strip()
     log("categoria", product["categoria"])
 
-    # DESCRIÇÃO (iframe editor1)
+    # DESCRIÇÃO
     iframe = page.frame_locator(
         "iframe[title='Editor de Rich Text, editor1']"
     )
@@ -102,12 +105,14 @@ def collect_product_data(page: Page) -> dict:
     log("estoque_minimo", product["estoque_minimo"])
 
     # CHECKBOX NOTIFICAÇÃO ESTOQUE BAIXO
-    checkbox_label = page.get_by_text("Notificação de estoque baixo")
-    checkbox_input = checkbox_label.locator(
-        "xpath=ancestor::label//input"
+    label = page.locator(
+        "label:has-text('Notificação de estoque baixo')"
     )
 
-    if checkbox_input.count() > 0:
+    checkbox_id = label.get_attribute("for")
+
+    if checkbox_id:
+        checkbox_input = page.locator(f"#{checkbox_id}")
         product["notificacao_estoque_baixo"] = checkbox_input.is_checked()
     else:
         product["notificacao_estoque_baixo"] = False
@@ -183,3 +188,4 @@ def collect_product_data(page: Page) -> dict:
         product["mensagem_adicional"])
 
     return product
+
