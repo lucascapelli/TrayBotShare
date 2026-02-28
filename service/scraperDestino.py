@@ -160,52 +160,6 @@ def parse_additional_infos(additional_infos: List[dict]) -> List[dict]:
     return parsed_infos
 
 # =========================
-# ✅ FUNÇÃO FALLBACK: EXTRAI IDS DO DOM
-# =========================
-def extract_ids_from_dom(page: Page, all_ids: set) -> bool:
-    """
-    Extrai IDs diretamente do DOM como fallback
-    Retorna True se encontrou novos IDs
-    """
-    try:
-        ids_on_page = page.evaluate(r"""
-            () => {
-                const ids = new Set();
-                
-                // Links de edição
-                document.querySelectorAll('a[href*="/products/"][href*="/edit"]').forEach(link => {
-                    const match = link.href.match(/\/products\/(\d+)\/edit/);
-                    if (match) ids.add(match[1]);
-                });
-                
-                // Atributos data-id
-                document.querySelectorAll('[data-id]').forEach(el => {
-                    const id = el.getAttribute('data-id');
-                    if (id && /^\d+$/.test(id)) ids.add(id);
-                });
-                
-                // Atributos data-product-id
-                document.querySelectorAll('[data-product-id]').forEach(el => {
-                    const id = el.getAttribute('data-product-id');
-                    if (id && /^\d+$/.test(id)) ids.add(id);
-                });
-                
-                return Array.from(ids);
-            }
-        """)
-        
-        new_ids = [pid for pid in ids_on_page if pid not in all_ids]
-        if new_ids:
-            all_ids.update(new_ids)
-            print(f"🔍 DOM: +{len(new_ids)} IDs encontrados")
-            return True
-            
-    except Exception as e:
-        print(f"⚠️ Erro ao extrair IDs do DOM: {str(e)[:50]}")
-    
-    return False
-
-# =========================
 # 1) COLETA DO JSON DA EDIÇÃO - ATUALIZADA ✅
 # =========================
 def collect_product_data(page: Page, produto_id: str, attempt: int = 1) -> Optional[dict]:
@@ -325,7 +279,7 @@ def collect_product_data(page: Page, produto_id: str, attempt: int = 1) -> Optio
         return None
 
 # =========================
-# 2) CAPTURA IDS - PAGINAÇÃO ROBUSTA ✅
+# 2) CAPTURA IDS - PAGINAÇÃO ROBUSTA ✅ COM DEBUG
 # =========================
 def collect_all_product_ids(page: Page, base_list_url: str) -> List[str]:
     """
@@ -335,23 +289,30 @@ def collect_all_product_ids(page: Page, base_list_url: str) -> List[str]:
     captured_pages = []
     
     def is_list_response(response):
-        """Identifica se a resposta é da listagem de produtos"""
+        """✅ ATUALIZADO: Identifica e loga APIs de produtos"""
         try:
             url = response.url
             ct = response.headers.get("content-type", "")
+            
+            # ✅ LOG DE DEBUG: Mostra TODAS as URLs JSON
+            if "application/json" in ct:
+                print(f"🔍 [API DEBUG] {url}")
             
             # Verifica se é API de listagem de produtos (vários padrões)
             if response.status == 200 and "application/json" in ct:
                 # Padrão 1: /api/products (sem ID específico)
                 if "/api/products" in url and not re.search(r'/products/\d+', url):
+                    print(f"✅ [LISTA] CAPTURADO: {url}")
                     return True
                 
                 # Padrão 2: products-search
                 if "products-search" in url:
+                    print(f"✅ [LISTA] CAPTURADO: {url}")
                     return True
                 
                 # Padrão 3: /products/search
                 if "/products/search" in url:
+                    print(f"✅ [LISTA] CAPTURADO: {url}")
                     return True
             
             return False
@@ -359,6 +320,7 @@ def collect_all_product_ids(page: Page, base_list_url: str) -> List[str]:
             return False
     
     print("🔍 Iniciando coleta de IDs via interceptação de API...")
+    print("🔍 [DEBUG] Monitorando requisições JSON...\n")
     
     # Primeira página
     try:
@@ -372,61 +334,43 @@ def collect_all_product_ids(page: Page, base_list_url: str) -> List[str]:
             captured_pages.append(data)
             page_ids = [str(item.get("id")) for item in data["data"] if item.get("id")]
             all_ids.update(page_ids)
-            print(f"✓ Página 1: {len(page_ids)} produtos capturados")
+            print(f"\n✓ Página 1: {len(page_ids)} produtos capturados")
         else:
-            print(f"⚠️ API retornou mas sem campo 'data'")
+            print(f"\n⚠️ API retornou mas sem campo 'data'")
             
     except Exception as e:
-        print(f"⚠️ Erro ao capturar primeira página: {str(e)[:100]}")
+        print(f"\n⚠️ Erro ao capturar primeira página: {str(e)[:100]}")
         print(f"   Tentando fallback via DOM...")
         # Fallback: extrai IDs do DOM
         extract_ids_from_dom(page, all_ids)
         if all_ids:
             print(f"✓ Fallback DOM: {len(all_ids)} IDs encontrados")
     
-    # ✅ MODO TESTE: Continua buscando ATÉ TER 5 IDs (ou não conseguir mais)
+    # ✅ MODO TESTE: Continua buscando até ter test_limit produtos
     if CONFIG.test_mode:
-        print(f"🧪 MODO TESTE: Buscando {CONFIG.test_limit} produtos...")
+        print(f"\n🧪 MODO TESTE ATIVADO: Buscando {CONFIG.test_limit} produtos...")
         
-        # Se JÁ tem 5+, retorna agora
+        # Se já tem suficiente na primeira página
         if len(all_ids) >= CONFIG.test_limit:
             all_ids_list = sorted(list(all_ids), key=lambda x: int(x) if x.isdigit() else 0)
-            print(f"✅ {len(all_ids)} IDs coletados na primeira página")
+            print(f"✅ Já coletados {len(all_ids)} IDs suficientes")
             return all_ids_list[:CONFIG.test_limit]
         
-        # Se NÃO tem 5, busca mais (MAS SÓ ATÉ TER 5)
-        print(f"⚠️ Apenas {len(all_ids)} IDs, buscando mais...")
-        
-        current_page = 1
-        max_attempts = 3  # ✅ NOVO: Máximo 3 tentativas de paginação
-        
-        while len(all_ids) < CONFIG.test_limit and current_page < max_attempts:
-            # Tenta clicar próxima página
-            next_clicked = try_click_next_page(page, current_page, is_list_response, all_ids)
-            
-            if next_clicked:
-                current_page += 1
-                # Se AGORA tem 5+, para
-                if len(all_ids) >= CONFIG.test_limit:
-                    break
-            else:
-                # Se não conseguiu clicar, tenta DOM
-                extract_ids_from_dom(page, all_ids)
-                break
-        
-        all_ids_list = sorted(list(all_ids), key=lambda x: int(x) if x.isdigit() else 0)
-        actual = min(len(all_ids_list), CONFIG.test_limit)
-        print(f"✅ Modo teste: {actual} produtos encontrados")
-        return all_ids_list[:CONFIG.test_limit]
+        # Caso contrário, continua buscando...
+        print(f"⚠️ Apenas {len(all_ids)} IDs na primeira página, buscando mais...")
     
-    # ========================================
-    # MODO PRODUÇÃO: Coleta TODAS as páginas
-    # ========================================
+    # Paginação
     current_page = 1
     no_progress_count = 0
     
     while current_page < CONFIG.max_pages and no_progress_count < CONFIG.max_scroll_attempts:
         previous_count = len(all_ids)
+        
+        # ✅ Verifica se já atingiu o limite do modo teste
+        if CONFIG.test_mode and len(all_ids) >= CONFIG.test_limit:
+            all_ids_list = sorted(list(all_ids), key=lambda x: int(x) if x.isdigit() else 0)
+            print(f"✅ Modo teste: {len(all_ids)} produtos encontrados")
+            return all_ids_list[:CONFIG.test_limit]
         
         # Tenta encontrar e clicar no botão "próxima"
         next_clicked = try_click_next_page(page, current_page, is_list_response, all_ids)
@@ -496,6 +440,49 @@ def try_click_next_page(page: Page, current_page: int, is_list_response, all_ids
                         return True
         except Exception:
             continue
+    
+    return False
+
+def extract_ids_from_dom(page: Page, all_ids: set) -> bool:
+    """
+    Extrai IDs diretamente do DOM como fallback
+    Retorna True se encontrou novos IDs
+    """
+    try:
+        ids_on_page = page.evaluate(r"""
+            () => {
+                const ids = new Set();
+                
+                // Links de edição
+                document.querySelectorAll('a[href*="/products/"][href*="/edit"]').forEach(link => {
+                    const match = link.href.match(/\/products\/(\d+)\/edit/);
+                    if (match) ids.add(match[1]);
+                });
+                
+                // Atributos data-id
+                document.querySelectorAll('[data-id]').forEach(el => {
+                    const id = el.getAttribute('data-id');
+                    if (id && /^\d+$/.test(id)) ids.add(id);
+                });
+                
+                // Atributos data-product-id
+                document.querySelectorAll('[data-product-id]').forEach(el => {
+                    const id = el.getAttribute('data-product-id');
+                    if (id && /^\d+$/.test(id)) ids.add(id);
+                });
+                
+                return Array.from(ids);
+            }
+        """)
+        
+        new_ids = [pid for pid in ids_on_page if pid not in all_ids]
+        if new_ids:
+            all_ids.update(new_ids)
+            print(f"🔍 DOM: +{len(new_ids)} IDs encontrados")
+            return True
+            
+    except Exception as e:
+        print(f"⚠️ Erro ao extrair IDs do DOM: {str(e)[:50]}")
     
     return False
 

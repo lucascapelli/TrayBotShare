@@ -1,18 +1,19 @@
-# main.py - VERSÃO ATUALIZADA COM MENU + SUPORTE DESTINO + PREP PARA SYNC
+# main.py - VERSÃO ATUALIZADA COM DOIS SCRAPERS
 import os
 import json
 from dotenv import load_dotenv
 from patchright.sync_api import sync_playwright
 
 from service.auth import authenticate
-from service.scraper import collect_all_products
+from service.scraper import collect_all_products as collect_origem  # ← ORIGEM
+from service.scraperDestino import collect_all_products as collect_destino  # ← DESTINO
 from service.storage import JSONStorage
 # NOVO: import do sync (vamos criar esse arquivo)
 from service.sync import run_sync
 
 load_dotenv()
 
-HEADLESS = False 
+HEADLESS = True 
 
 # ==================== CONFIGURAÇÃO GERAL ====================
 ORIGEM_URL = os.getenv("ORIGEM_URL")
@@ -30,11 +31,13 @@ COOKIES_DESTINO_FILES = ["cookies_destino.json", "cookiesdestino.json", "cookies
 # Storages separados (agora instanciamos com paths diferentes)
 STORAGE_ORIGEM = JSONStorage(
     json_path="produtos/ProdutosOrigem.json",
-    csv_path="produtos/ProdutosOrigem.csv"
+    csv_path="produtos/ProdutosOrigem.csv",
+    replace_on_start=False
 )
 STORAGE_DESTINO = JSONStorage(
     json_path="produtos/ProdutosDestino.json",
-    csv_path="produtos/ProdutosDestino.csv"
+    csv_path="produtos/ProdutosDestino.csv",
+    replace_on_start=True  # ← Limpa no início
 )
 
 
@@ -67,13 +70,13 @@ def main():
             print("\n📋 COLETANDO ORIGEM...")
             page = authenticate(context, ORIGEM_URL, SOURCE_USER, SOURCE_PASS, COOKIES_ORIGEM_FILES)
             if page:
-                collect_all_products(page, STORAGE_ORIGEM)   # agora passa storage específico
+                collect_origem(page, STORAGE_ORIGEM)  # ← Usa scraper.py
 
         elif escolha == "2":
             print("\n📋 COLETANDO DESTINO...")
             page = authenticate(context, DESTINO_URL, TARGET_USER, TARGET_PASS, COOKIES_DESTINO_FILES)
             if page:
-                collect_all_products(page, STORAGE_DESTINO)
+                collect_destino(page, STORAGE_DESTINO)  # ← Usa scraperDestino.py
 
         elif escolha == "3":
             print("\n🔄 INICIANDO COMPARAÇÃO + SYNC (destino → origem)...")

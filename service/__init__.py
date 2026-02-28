@@ -12,33 +12,24 @@ from .auth import (
     needs_login
 )
 
-# Tenta importar do scraper_optimized primeiro, senão do scraper normal
+# Importa scrapers (origem e destino)
 try:
     from .scraper import (
-        collect_all_products,
-        process_all_products,
-        retry_failed_products,
-        collect_all_product_ids,
-        CONFIG as SCRAPER_CONFIG
+        collect_all_products as collect_origem,
+        CONFIG as SCRAPER_CONFIG_ORIGEM
     )
-    print("✅ Usando scraper OTIMIZADO (6-7h)")
-except ImportError:
-    try:
-        from .scraper import (
-            collect_all_products,
-            process_all_products,
-            retry_failed_products,
-            collect_all_product_ids,
-            CONFIG as SCRAPER_CONFIG
-        )
-        print("⚠️ Usando scraper normal (11h)")
-    except ImportError:
-        print("❌ Erro: Nenhum scraper encontrado!")
-        raise
+    from .scraperDestino import (
+        collect_all_products as collect_destino,
+        CONFIG as SCRAPER_CONFIG_DESTINO
+    )
+    print("✅ Scrapers ORIGEM e DESTINO carregados (modo otimizado)")
+except ImportError as e:
+    print(f"❌ Erro ao carregar scrapers: {e}")
+    raise
 
 # Importa storage
 try:
-    from .storage import storage
+    from .storage import storage_origem, storage_destino
     __all__ = [
         # Auth
         'authenticate',
@@ -47,14 +38,14 @@ try:
         'save_cookies',
         'human_type',
         'needs_login',
-        # Scraper
-        'collect_all_products',
-        'process_all_products',
-        'retry_failed_products',
-        'collect_all_product_ids',
-        'SCRAPER_CONFIG',
+        # Scrapers
+        'collect_origem',
+        'collect_destino',
+        'SCRAPER_CONFIG_ORIGEM',
+        'SCRAPER_CONFIG_DESTINO',
         # Storage
-        'storage'
+        'storage_origem',
+        'storage_destino'
     ]
 except ImportError:
     __all__ = [
@@ -65,37 +56,41 @@ except ImportError:
         'save_cookies',
         'human_type',
         'needs_login',
-        # Scraper
-        'collect_all_products',
-        'process_all_products',
-        'retry_failed_products',
-        'collect_all_product_ids',
-        'SCRAPER_CONFIG'
+        # Scrapers
+        'collect_origem',
+        'collect_destino',
+        'SCRAPER_CONFIG_ORIGEM',
+        'SCRAPER_CONFIG_DESTINO'
     ]
 
 # Configuração global
-def get_config():
+def get_config(origem=True):
     """Retorna configuração atual do scraper"""
+    config = SCRAPER_CONFIG_ORIGEM if origem else SCRAPER_CONFIG_DESTINO
     return {
-        'timeout_per_product': SCRAPER_CONFIG.timeout_per_product,
-        'max_retries': SCRAPER_CONFIG.max_retries,
-        'retry_delay': SCRAPER_CONFIG.retry_delay,
-        'batch_size': SCRAPER_CONFIG.batch_size,
-        'max_pages': SCRAPER_CONFIG.max_pages,
-        'max_scroll_attempts': SCRAPER_CONFIG.max_scroll_attempts,
-        'page_size': SCRAPER_CONFIG.page_size
+        'timeout_per_product': config.timeout_per_product,
+        'max_retries': config.max_retries,
+        'retry_delay': config.retry_delay,
+        'batch_size': config.batch_size,
+        'max_pages': config.max_pages,
+        'max_scroll_attempts': config.max_scroll_attempts,
+        'page_size': config.page_size,
+        'test_mode': config.test_mode,
+        'test_limit': config.test_limit
     }
 
-def set_config(**kwargs):
+def set_config(origem=True, **kwargs):
     """
     Atualiza configurações do scraper
     
     Exemplo:
-        set_config(timeout_per_product=15000, max_retries=3)
+        set_config(origem=True, test_mode=False)  # Produção na origem
+        set_config(origem=False, test_limit=10)   # 10 produtos no destino
     """
+    config = SCRAPER_CONFIG_ORIGEM if origem else SCRAPER_CONFIG_DESTINO
     for key, value in kwargs.items():
-        if hasattr(SCRAPER_CONFIG, key):
-            setattr(SCRAPER_CONFIG, key, value)
-            print(f"✓ {key} = {value}")
+        if hasattr(config, key):
+            setattr(config, key, value)
+            print(f"✓ {'ORIGEM' if origem else 'DESTINO'}: {key} = {value}")
         else:
             print(f"⚠️ Configuração '{key}' não existe")
