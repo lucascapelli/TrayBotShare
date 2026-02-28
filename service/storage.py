@@ -11,14 +11,31 @@ DEFAULT_DIR = "produtos"
 DEFAULT_JSON = os.path.join(DEFAULT_DIR, "ProdutosOrigem.json")
 DEFAULT_CSV = os.path.join(DEFAULT_DIR, "ProdutosOrigem.csv")
 
-
 class JSONStorage:
-    def __init__(self, json_path: str = DEFAULT_JSON, csv_path: str = DEFAULT_CSV):
+    def __init__(
+        self,
+        json_path: str = DEFAULT_JSON,
+        csv_path: str = DEFAULT_CSV,
+        replace_on_start: bool = False
+    ):
         self.json_path = json_path
         self.csv_path = csv_path
+        self.replace_on_start = replace_on_start
+
         os.makedirs(os.path.dirname(self.json_path) or ".", exist_ok=True)
         self._lock = threading.Lock()
-        self._items: List[Dict[str, Any]] = self._load_existing()
+
+        if self.replace_on_start:
+            # inicia com lista vazia e grava imediatamente (destino)
+            self._items: List[Dict[str, Any]] = []
+            try:
+                self._atomic_write_json(self._items)
+            except Exception:
+                # se falhar, ainda inicializa em memória
+                pass
+        else:
+            # carrega o que já existe (origem)
+            self._items: List[Dict[str, Any]] = self._load_existing()
 
     # ---- internal helpers ----
     def _load_existing(self) -> List[Dict[str, Any]]:
@@ -35,6 +52,10 @@ class JSONStorage:
         return []
 
     def _atomic_write_json(self, data: List[Dict[str, Any]]):
+        """
+        Escreve o arquivo inteiro de forma atômica (temp -> move).
+        Isso garante que o arquivo final sempre seja um JSON completo.
+        """
         dirpath = os.path.dirname(self.json_path) or "."
         fd, tmp = tempfile.mkstemp(prefix="tmp_products_", dir=dirpath)
         os.close(fd)
@@ -56,27 +77,27 @@ class JSONStorage:
     def save(self, obj: Dict[str, Any]) -> None:
         """
         Salva um produto imediatamente no JSON (arquivo contém um array).
-        Também adiciona na memória para estatísticas.
+        Mantém o comportamento original: armazena objeto em memória e regrava o
+        arquivo inteiro de forma atômica.
         """
         if not isinstance(obj, dict):
             return
         with self._lock:
-            # normalizar/limpar campos mínimos
             item = obj.copy()
-            # força string id se existir
             if "produto_id" in item:
                 item["produto_id"] = str(item["produto_id"])
             self._items.append(item)
-            # escreve o arquivo inteiro (suficiente para até milhares de registros)
             try:
+                # escreve o arquivo inteiro (não escreve em pedaços)
                 self._atomic_write_json(self._items)
             except Exception as e:
-                # se falhar, mantém em memória (não propaga para não quebrar o scraper)
                 print(f"[storage] Erro ao salvar JSON: {e}")
 
     def save_many(self, objs: Iterable[Dict[str, Any]]) -> None:
         """
         Salva vários objetos de uma vez (usa mesma lógica atômica).
+        Regrava o arquivo inteiro ao final da operação.
+        ✅ MODIFICADO: Agora também exporta CSV automaticamente
         """
         with self._lock:
             added = 0
@@ -88,9 +109,58 @@ class JSONStorage:
                     added += 1
             if added:
                 try:
+                    # escreve o arquivo inteiro (não escreve em pedaços)
                     self._atomic_write_json(self._items)
+                    # ✅ NOVO: exporta CSV automaticamente após salvar JSON
+                    self._export_csv_internal()
                 except Exception as e:
                     print(f"[storage] Erro ao salvar many JSON: {e}")
+
+    def _export_csv_internal(self):
+        """
+        ✅ NOVO: Método interno para exportar CSV (sem lock, chamado de dentro do save_many)
+        """
+        try:
+            path = self.csv_path
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+            header = [
+                "produto_id", "nome", "preco", "estoque", "estoque_minimo",
+                "categoria", "referencia", "peso", "altura", "largura", "comprimento",
+                "imagem_url", "notificacao_estoque_baixo", "itens_inclusos",
+                "mensagem_adicional", "tempo_garantia", "seo_link", "seo_title",
+                "seo_description", "descricao"
+            ]
+
+            dirpath = os.path.dirname(path) or "."
+            fd, tmp = tempfile.mkstemp(prefix="tmp_products_csv_", dir=dirpath, text=True)
+            os.close(fd)
+            try:
+                with open(tmp, "w", newline="", encoding="utf-8") as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=header, extrasaction="ignore")
+                    writer.writeheader()
+                    for p in self._items:
+                        row = {k: "" for k in header}
+                        for k in ["produto_id", "nome", "preco", "estoque", "estoque_minimo",
+                                  "categoria", "referencia", "peso", "altura", "largura", "comprimento",
+                                  "imagem_url", "notificacao_estoque_baixo", "itens_inclusos",
+                                  "mensagem_adicional", "tempo_garantia", "descricao"]:
+                            if k in p:
+                                row[k] = p.get(k, "")
+                        seo = p.get("seo_preview") or {}
+                        row["seo_link"] = seo.get("link") or ""
+                        row["seo_title"] = seo.get("title") or ""
+                        row["seo_description"] = seo.get("description") or ""
+                        writer.writerow(row)
+                shutil.move(tmp, path)
+            finally:
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[storage] Erro ao exportar CSV automaticamente: {e}")
 
     def read_all(self) -> List[Dict[str, Any]]:
         """Retorna a lista atual em memória (carregada do arquivo no startup)."""
@@ -139,7 +209,6 @@ class JSONStorage:
         ]
 
         with self._lock:
-            # escreve em temp e move
             dirpath = os.path.dirname(path) or "."
             fd, tmp = tempfile.mkstemp(prefix="tmp_products_csv_", dir=dirpath, text=True)
             os.close(fd)
@@ -149,14 +218,12 @@ class JSONStorage:
                     writer.writeheader()
                     for p in self._items:
                         row = {k: "" for k in header}
-                        # mapeia campos simples
                         for k in ["produto_id", "nome", "preco", "estoque", "estoque_minimo",
                                   "categoria", "referencia", "peso", "altura", "largura", "comprimento",
                                   "imagem_url", "notificacao_estoque_baixo", "itens_inclusos",
                                   "mensagem_adicional", "tempo_garantia", "descricao"]:
                             if k in p:
                                 row[k] = p.get(k, "")
-                        # metadados SEO
                         seo = p.get("seo_preview") or {}
                         row["seo_link"] = seo.get("link") or ""
                         row["seo_title"] = seo.get("title") or ""
@@ -182,5 +249,20 @@ class JSONStorage:
                 pass
 
 
-# expose default instance for `from service import storage`
-storage = JSONStorage()
+# INSTÂNCIAS ISOLADAS (origem e destino).
+# origem: mantém histórico (append)
+# destino: recria arquivo no início da execução (replace_on_start=True)
+storage_origem = JSONStorage(
+    json_path=os.path.join(DEFAULT_DIR, "ProdutosOrigem.json"),
+    csv_path=os.path.join(DEFAULT_DIR, "ProdutosOrigem.csv"),
+    replace_on_start=False
+)
+
+storage_destino = JSONStorage(
+    json_path=os.path.join(DEFAULT_DIR, "ProdutosDestino.json"),
+    csv_path=os.path.join(DEFAULT_DIR, "ProdutosDestino.csv"),
+    replace_on_start=True
+)
+
+# compatibilidade com import existing code: `from service.storage import storage`
+storage = storage_origem
