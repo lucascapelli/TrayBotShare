@@ -37,7 +37,7 @@ logger = logging.getLogger("main")
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-HEADLESS = False
+HEADLESS = True
 
 ORIGEM_URL = os.getenv("ORIGEM_URL", "")
 DESTINO_URL = os.getenv("DESTINO_URL", "https://www.grasielyatacado.com.br/admin/products/list")
@@ -190,21 +190,20 @@ def action_collect_destino(browser: Browser) -> None:
 
 
 def action_sync(browser: Browser) -> None:
-    logger.info("Iniciando comparação + sync (destino → origem)...")
+    logger.info("Iniciando sync ORIGEM → DESTINO (atualizar produtos no Atacado)...")
     ctx, page = auth_in_context(
-        browser, ORIGEM_URL, SOURCE_USER, SOURCE_PASS, COOKIES_ORIGEM, "ORIGEM"
+        browser, DESTINO_URL, TARGET_USER, TARGET_PASS, COOKIES_DESTINO, "DESTINO"
     )
     if not page:
-        logger.error("Autenticação na ORIGEM falhou")
+        logger.error("Autenticação no DESTINO falhou")
         return
     try:
-        # run_sync recebe o context para poder navegar internamente
         run_sync(
             ctx, STORAGE_ORIGEM, STORAGE_DESTINO,
             ORIGEM_URL, SOURCE_USER, SOURCE_PASS, COOKIES_ORIGEM,
         )
     finally:
-        safe_close(ctx, "ORIGEM")
+        safe_close(ctx, "DESTINO")
 
 
 def action_sync_additional(browser: Browser) -> None:
@@ -267,7 +266,7 @@ MENU = """
 ======================================================================
   1  Colher dados ORIGEM
   2  Colher dados DESTINO
-  3  Comparar + Sync (destino → origem)
+  3  Sync ORIGEM → DESTINO (atualizar produtos)
   4  Sync Info Adicionais (origem → destino)
   0  Sair
 ----------------------------------------------------------------------"""
