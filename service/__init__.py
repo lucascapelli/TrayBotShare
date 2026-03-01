@@ -1,96 +1,177 @@
-# service/__init__.py
-"""
-Service package - Integração de autenticação e scraping otimizado
-"""
+# auth.py
+import os
+import json
+import random
+import time
+from patchright.sync_api import Page  # ← TROQUEI AQUI
 
-from .auth import (
-    authenticate, 
-    login_if_needed, 
-    load_cookies, 
-    save_cookies, 
-    human_type,
-    needs_login
-)
 
-# Importa scrapers (origem e destino)
-try:
-    from .scraper import (
-        collect_all_products as collect_origem,
-        CONFIG as SCRAPER_CONFIG_ORIGEM
-    )
-    from .scraperDestino import (
-        collect_all_products as collect_destino,
-        CONFIG as SCRAPER_CONFIG_DESTINO
-    )
-    print("✅ Scrapers ORIGEM e DESTINO carregados (modo otimizado)")
-except ImportError as e:
-    print(f"❌ Erro ao carregar scrapers: {e}")
-    raise
+def find_existing(path_options):
+    for p in path_options:
+        if os.path.isfile(p):
+            return p
+    return None
 
-# Importa storage
-try:
-    from .storage import storage_origem, storage_destino
-    __all__ = [
-        # Auth
-        'authenticate',
-        'login_if_needed',
-        'load_cookies',
-        'save_cookies',
-        'human_type',
-        'needs_login',
-        # Scrapers
-        'collect_origem',
-        'collect_destino',
-        'SCRAPER_CONFIG_ORIGEM',
-        'SCRAPER_CONFIG_DESTINO',
-        # Storage
-        'storage_origem',
-        'storage_destino'
-    ]
-except ImportError:
-    __all__ = [
-        # Auth
-        'authenticate',
-        'login_if_needed',
-        'load_cookies',
-        'save_cookies',
-        'human_type',
-        'needs_login',
-        # Scrapers
-        'collect_origem',
-        'collect_destino',
-        'SCRAPER_CONFIG_ORIGEM',
-        'SCRAPER_CONFIG_DESTINO'
-    ]
 
-# Configuração global
-def get_config(origem=True):
-    """Retorna configuração atual do scraper"""
-    config = SCRAPER_CONFIG_ORIGEM if origem else SCRAPER_CONFIG_DESTINO
-    return {
-        'timeout_per_product': config.timeout_per_product,
-        'max_retries': config.max_retries,
-        'retry_delay': config.retry_delay,
-        'batch_size': config.batch_size,
-        'max_pages': config.max_pages,
-        'max_scroll_attempts': config.max_scroll_attempts,
-        'page_size': config.page_size,
-        'test_mode': config.test_mode,
-        'test_limit': config.test_limit
-    }
+def normalize_cookies(raw_cookies):
+    cleaned = []
+    for c in raw_cookies:
+        cookie = {
+            "name": c["name"],
+            "value": c["value"],
+            "domain": c["domain"],
+            "path": c.get("path", "/"),
+            "httpOnly": c.get("httpOnly", False),
+            "secure": c.get("secure", False),
+        }
 
-def set_config(origem=True, **kwargs):
-    """
-    Atualiza configurações do scraper
-    
-    Exemplo:
-        set_config(origem=True, test_mode=False)  # Produção na origem
-        set_config(origem=False, test_limit=10)   # 10 produtos no destino
-    """
-    config = SCRAPER_CONFIG_ORIGEM if origem else SCRAPER_CONFIG_DESTINO
-    for key, value in kwargs.items():
-        if hasattr(config, key):
-            setattr(config, key, value)
-            print(f"✓ {'ORIGEM' if origem else 'DESTINO'}: {key} = {value}")
-        else:
-            print(f"⚠️ Configuração '{key}' não existe")
+        if "expirationDate" in c:
+            try:
+                cookie["expires"] = int(float(c["expirationDate"]))
+            except Exception:
+                pass
+
+        ss = c.get("sameSite")
+        if ss:
+            ss = ss.lower()
+            if ss == "lax":
+                cookie["sameSite"] = "Lax"
+            elif ss == "strict":
+                cookie["sameSite"] = "Strict"
+            elif ss in ("no_restriction", "none"):
+                cookie["sameSite"] = "None"
+
+        cleaned.append(cookie)
+    return cleaned
+
+
+def load_cookies(context, cookie_files):
+    cookie_path = find_existing(cookie_files)
+    if not cookie_path:
+        return None
+
+    with open(cookie_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    cookies = normalize_cookies(raw)
+    try:
+        context.add_cookies(cookies)
+    except Exception:
+        pass
+    return cookie_path
+
+
+def save_cookies(context, filepath):
+    try:
+        cookies = context.cookies()
+    except Exception:
+        cookies = []
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(cookies, f, indent=2, ensure_ascii=False)
+
+
+def needs_login(page: Page):
+    try:
+        url = page.url.lower()
+        if "login" in url or "entrar" in url:
+            return True
+        if page.locator("#usuario, input[type='email'], input[name='username']").count() > 0:
+            return True
+        if page.locator("input[type='password']").count() > 0:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def human_type(page, selector, text):
+    locator = page.locator(selector)
+    locator.click()
+    for char in text:
+        locator.press(char)
+        time.sleep(random.uniform(0.07, 0.18))
+
+
+def login_if_needed(context, page: Page, username, password, cookie_save_path=None):
+    if not needs_login(page):
+        return True
+
+    if not username or not password:
+        return False
+
+    # espera campos
+    page.wait_for_selector("#usuario, input[type='email'], input[name='username']", timeout=15000)
+    page.wait_for_selector("#senha, input[type='password']", timeout=15000)
+
+    # mouse humano
+    page.mouse.move(random.randint(150, 800), random.randint(100, 600), steps=18)
+
+    # digitação humana (Tray detecta fill rápido)
+    if page.locator("#usuario").count() > 0:
+        human_type(page, "#usuario", username)
+    else:
+        human_type(page, "input[type='email'], input[name='username']", username)
+
+    time.sleep(random.uniform(0.8, 1.6))
+    human_type(page, "#senha, input[type='password']", password)
+
+    time.sleep(random.uniform(1.2, 2.5))
+
+    # submit
+    submit = page.locator("button[type='submit'], input[type='submit'], .btn-login")
+    if submit.count() > 0:
+        submit.first.click()
+    else:
+        page.keyboard.press("Enter")
+
+    page.wait_for_timeout(random.randint(4000, 6500))
+
+    # OTP
+    if page.locator("#code").count() > 0:
+        code = input("Digite o código OTP: ").strip()
+        page.locator("#code").fill(code)
+        page.locator("#code").press("Enter")
+        page.wait_for_timeout(4000)
+
+    if needs_login(page):
+        return False
+
+    if cookie_save_path:
+        save_cookies(context, cookie_save_path)
+
+    return True
+
+
+def authenticate(context, url, username, password, cookie_files):
+    cookie_path = load_cookies(context, cookie_files)
+    page = context.new_page()
+
+    try:
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        except Exception:
+            page.goto(url, timeout=90000)
+
+        page.wait_for_load_state("networkidle", timeout=15000)
+
+        save_path = cookie_path or cookie_files[0]
+
+        ok = login_if_needed(context, page, username, password, cookie_save_path=save_path)
+
+        if not ok:
+            print("\n[ERRO] Falha no login. Navegador pausado para análise.")
+            input("Pressione ENTER para encerrar...")
+            return None
+
+        page.wait_for_timeout(random.randint(3500, 6000))
+        page.mouse.move(random.randint(400, 1200), random.randint(300, 800), steps=25)
+
+        return page
+
+    except Exception as e:
+        print("\n[ERRO INESPERADO]")
+        print(type(e).__name__, "-", str(e))
+        print("Execução pausada. Analise o navegador aberto.")
+        input("Pressione ENTER para encerrar...")
+
+        return None

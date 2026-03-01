@@ -20,7 +20,7 @@ class ScraperConfig:
     max_pages: int = 300
     max_scroll_attempts: int = 15
     page_size: int = 25
-    test_mode: bool = True  # ✅ MODO TESTE: True = apenas 5 produtos | False = todos
+    test_mode: bool = False  # ✅ MODO TESTE: True = apenas 5 produtos | False = todos
     test_limit: int = 5  # ✅ Quantos produtos no modo teste
 
 CONFIG = ScraperConfig()

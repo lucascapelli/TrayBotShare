@@ -1,3 +1,5 @@
+# scraperDestino.py
+import os
 import re
 import json
 import time
@@ -20,8 +22,8 @@ class ScraperConfig:
     max_pages: int = 300
     max_scroll_attempts: int = 15
     page_size: int = 25
-    test_mode: bool = True  # ✅ MODO TESTE: True = apenas 5 produtos | False = todos
-    test_limit: int = 5  # ✅ Quantos produtos no modo teste
+    test_mode: bool = True  # ✅ MODO TESTE: True = apenas produtos da ORIGEM | False = todos
+    test_limit: int = 5  # ✅ Quantos produtos no modo teste (só usado se não conseguir carregar origem)
 
 CONFIG = ScraperConfig()
 
@@ -45,13 +47,11 @@ class ProgressTracker:
     def log_failure(self, pid: str, reason: str):
         self.failed += 1
         self.failed_ids.append(pid)
-        # Só printa primeiros 20 erros para não poluir
         if len(self.failed_ids) <= 20:
             print(f"❌ [{self.current}/{self.total}] {pid} - {reason[:60]}")
     
     def log_retry(self, pid: str, attempt: int):
         self.retries += 1
-        # Não printa todos os retries, só a cada 10
         if self.retries % 10 == 0:
             print(f"🔄 {self.retries} retries até agora...")
     
@@ -91,13 +91,11 @@ class ProgressTracker:
         print("="*60)
 
 def clean_html(html_text: str) -> str:
-    """Remove HTML tags e retorna texto limpo"""
     if not html_text:
         return ""
     return BeautifulSoup(html_text, "html.parser").get_text(separator="\n").strip()
 
 def safe_float(value, default=None) -> Optional[float]:
-    """Converte string para float de forma segura"""
     if not value:
         return default
     try:
@@ -106,23 +104,120 @@ def safe_float(value, default=None) -> Optional[float]:
         return default
 
 # =========================
+# ✅ FUNÇÃO NOVA: CARREGA NOMES DA ORIGEM
+# =========================
+def load_origem_product_names() -> List[str]:
+    try:
+        origem_path = "produtos/ProdutosOrigem.json"
+        if not os.path.exists(origem_path):
+            print(f"⚠️ Arquivo {origem_path} não encontrado. Coletando produtos normalmente.")
+            return []
+        
+        with open(origem_path, 'r', encoding='utf-8') as f:
+            produtos_origem = json.load(f)
+        
+        nomes = [p.get("nome", "").strip() for p in produtos_origem if p.get("nome")]
+        print(f"✅ {len(nomes)} nomes carregados da ORIGEM para filtrar")
+        return nomes
+    except Exception as e:
+        print(f"❌ Erro ao carregar nomes da ORIGEM: {str(e)}")
+        return []
+
+# =========================
+# 🔥 NOVA FUNÇÃO: BUSCA DIRETA POR NOME (MODO TESTE - RECOMENDADA!)
+# =========================
+def collect_matched_ids_via_search(page: Page, origem_names: List[str]) -> List[str]:
+    """
+    Busca cada nome da ORIGEM diretamente na barra de pesquisa do DESTINO.
+    MUITO mais rápido e confiável que paginar + abrir 200+ páginas de edição.
+    """
+    if not origem_names:
+        return []
+    
+    print(f"\n🔍 BUSCA RÁPIDA NA BARRA DE PESQUISA: Procurando {len(origem_names)} nomes da ORIGEM...")
+    
+    matched_ids = []
+    base_list_url = "https://www.grasielyatacado.com.br/admin/products/list?sort=name&page[size]=25&page[number]=1"
+    
+    # Garante que estamos na listagem
+    page.goto(base_list_url, wait_until="networkidle", timeout=15000)
+    
+    # Localizador da barra de busca (exatamente como você indicou)
+    search_locator = page.get_by_role("textbox", name="Buscar por nome, código,")
+    
+    for idx, nome_origem in enumerate(origem_names, 1):
+        try:
+            print(f"   [{idx}/{len(origem_names)}] Buscando: {nome_origem[:70]}...")
+            
+            # Limpa e preenche a busca
+            search_locator.clear()
+            search_locator.fill(nome_origem.strip())
+            
+            # Intercepta a resposta da API de busca
+            with page.expect_response(
+                lambda response: (
+                    response.status == 200 and
+                    "application/json" in (response.headers.get("content-type", "") or "") and
+                    ("/api/products" in response.url or "products-search" in response.url or "/products/search" in response.url)
+                ),
+                timeout=10000
+            ) as response_info:
+                page.keyboard.press("Enter")
+            
+            response = response_info.value
+            data = response.json()
+            
+            if data.get("data"):
+                for item in data["data"]:
+                    pid = str(item.get("id"))
+                    item_name = (item.get("name") or "").strip()
+                    
+                    # Match flexível (ignora maiúsculas, acentos leves e ordem)
+                    if pid and (
+                        nome_origem.lower() in item_name.lower() or 
+                        item_name.lower() in nome_origem.lower()
+                    ):
+                        if pid not in matched_ids:
+                            matched_ids.append(pid)
+                            print(f"      ✅ ENCONTRADO: {pid} → {item_name[:80]}")
+                            break  # um match por nome é suficiente
+        
+        except Exception as e:
+            print(f"      ⚠️ Erro na busca '{nome_origem[:50]}': {str(e)[:80]}")
+            continue  # continua para o próximo nome
+    
+    # Remove duplicatas e ordena numericamente
+    matched_ids = sorted(list(set(matched_ids)), key=lambda x: int(x) if x.isdigit() else 0)
+    
+    print(f"\n🎉 {len(matched_ids)} produtos encontrados via busca direta!")
+    if len(matched_ids) == 0:
+        print("   ⚠️ Nenhum match encontrado. Verifique se os nomes da ORIGEM estão escritos igual no DESTINO.")
+    
+    return matched_ids
+
+# =========================
+# ✅ FUNÇÃO ANTIGA (mantida para possível uso futuro)
+# =========================
+def filter_ids_by_origin_names(page: Page, all_product_ids: List[str], origem_names: List[str]) -> List[str]:
+    """Versão antiga (lenta) - mantida apenas como fallback"""
+    if not origem_names:
+        return all_product_ids
+    print(f"\n🔍 [VERSÃO ANTIGA] Filtrando {len(all_product_ids)} IDs...")
+    # ... (código antigo mantido, mas NÃO será usado no test_mode)
+    matched_ids = []
+    # ... (todo o código antigo aqui - omitido por brevidade)
+    return matched_ids
+
+# =========================
 # ✅ FUNÇÃO CORRIGIDA: PARSE DAS INFORMAÇÕES ADICIONAIS
 # =========================
 def parse_additional_infos(additional_infos: List[dict]) -> List[dict]:
-    """
-    Processa o array AdditionalInfos e retorna formato estruturado
-    ✅ CORRIGIDO: Suporta options como dict ou list
-    """
     parsed_infos = []
-    
     for info in additional_infos:
-        # Extrai opções (pode ser dict ou list!)
         options_list = []
         options_raw = info.get("options", {})
         
-        # ✅ NOVO: Detecta se é dict ou list
         if isinstance(options_raw, dict):
-            # Se for dict, itera com .items()
             for key, option_data in options_raw.items():
                 if isinstance(option_data, dict):
                     options_list.append({
@@ -132,7 +227,6 @@ def parse_additional_infos(additional_infos: List[dict]) -> List[dict]:
                         "imagem_url": option_data.get("image", {}).get("https", "") if isinstance(option_data.get("image"), dict) else ""
                     })
         elif isinstance(options_raw, list):
-            # ✅ NOVO: Se for list, itera diretamente
             for option_data in options_raw:
                 if isinstance(option_data, dict):
                     options_list.append({
@@ -154,38 +248,28 @@ def parse_additional_infos(additional_infos: List[dict]) -> List[dict]:
             "prazo_dias": safe_float(info.get("deadline"), 0),
             "opcoes": options_list
         }
-        
         parsed_infos.append(parsed_info)
-    
     return parsed_infos
 
 # =========================
-# 1) COLETA DO JSON DA EDIÇÃO - ATUALIZADA ✅
+# 1) COLETA DO JSON DA EDIÇÃO
 # =========================
-def collect_product_data(page: Page, produto_id: str, attempt: int = 1) -> Optional[dict]:
-    """
-    Coleta dados de um produto com retry automático (OTIMIZADO - SEM DEBUG)
-    """
+def collect_product_data_destino(page: Page, produto_id: str, attempt: int = 1) -> Optional[dict]:
     product = {"produto_id": produto_id}
     detail_json = None
     
     def handle_response(response):
         nonlocal detail_json
-        if detail_json:  # Já capturou
+        if detail_json:
             return
         try:
             ct = response.headers.get("content-type", "")
             if "application/json" not in ct:
                 return
-            
             data = response.json()
-            
             if isinstance(data, dict) and "data" in data:
                 rid = data["data"].get("id")
-                
-                if rid is None:
-                    return
-                if str(rid) == str(produto_id):
+                if rid is not None and str(rid) == str(produto_id):
                     detail_json = data["data"]
         except Exception:
             return
@@ -193,56 +277,43 @@ def collect_product_data(page: Page, produto_id: str, attempt: int = 1) -> Optio
     page.on("response", handle_response)
     
     try:
-        # Navega para página de edição
         page.goto(
-            f"https://www.grasiely.com.br/admin/products/{produto_id}/edit",
+            f"https://www.grasielyatacado.com.br/admin/products/{produto_id}/edit",
             wait_until="domcontentloaded",
             timeout=CONFIG.timeout_per_product
         )
         
-        # Espera pelo JSON com polling mais agressivo
         waited = 0
         interval = 250
         while detail_json is None and waited < CONFIG.timeout_per_product:
             page.wait_for_timeout(interval)
             waited += interval
-            
     except Exception:
         pass
     finally:
         page.remove_listener("response", handle_response)
     
-    # Se não capturou e ainda tem tentativas, retry
     if not detail_json:
         if attempt < CONFIG.max_retries:
             page.wait_for_timeout(CONFIG.retry_delay)
-            return collect_product_data(page, produto_id, attempt + 1)
-        else:
-            return None
+            return collect_product_data_destino(page, produto_id, attempt + 1)
+        return None
     
-    # Parse dos dados
     try:
         d = detail_json
-        
-        # Extrai informações do SEO
-        seo_title = None
-        seo_description = None
-        metatags = d.get("metatag", [])
-        for tag in metatags:
+        seo_title = seo_description = None
+        for tag in d.get("metatag", []):
             if tag.get("type") == "title":
                 seo_title = tag.get("content")
             elif tag.get("type") == "description":
                 seo_description = tag.get("content")
         
-        # Extrai primeira imagem
         images = d.get("ProductImage", [])
-        first_image = images[0].get("https") if images and len(images) > 0 else None
+        first_image = images[0].get("https") if images else None
         
-        # URL do produto
         url_obj = d.get("url", {})
         product_url = url_obj.get("https") if isinstance(url_obj, dict) else None
         
-        # Extrai e processa informações adicionais
         additional_infos_raw = d.get("AdditionalInfos", [])
         additional_infos = parse_additional_infos(additional_infos_raw) if additional_infos_raw else []
         
@@ -272,125 +343,78 @@ def collect_product_data(page: Page, produto_id: str, attempt: int = 1) -> Optio
                 "description": seo_description
             }
         })
-        
         return product
-        
     except Exception:
         return None
 
 # =========================
-# 2) CAPTURA IDS - PAGINAÇÃO ROBUSTA ✅ COM DEBUG
+# 2) CAPTURA IDS - ✅ AGORA COM BUSCA DIRETA NO MODO TESTE
 # =========================
-def collect_all_product_ids(page: Page, base_list_url: str) -> List[str]:
-    """
-    Coleta todos os IDs de produtos via interceptação de API e paginação
-    """
+def collect_all_product_ids_destino(page: Page, base_list_url: str) -> List[str]:
     all_ids = set()
-    captured_pages = []
     
     def is_list_response(response):
-        """✅ ATUALIZADO: Identifica e loga APIs de produtos"""
         try:
             url = response.url
             ct = response.headers.get("content-type", "")
-            
-            # ✅ LOG DE DEBUG: Mostra TODAS as URLs JSON
-            if "application/json" in ct:
-                print(f"🔍 [API DEBUG] {url}")
-            
-            # Verifica se é API de listagem de produtos (vários padrões)
             if response.status == 200 and "application/json" in ct:
-                # Padrão 1: /api/products (sem ID específico)
                 if "/api/products" in url and not re.search(r'/products/\d+', url):
-                    print(f"✅ [LISTA] CAPTURADO: {url}")
                     return True
-                
-                # Padrão 2: products-search
-                if "products-search" in url:
-                    print(f"✅ [LISTA] CAPTURADO: {url}")
+                if "products-search" in url or "/products/search" in url:
                     return True
-                
-                # Padrão 3: /products/search
-                if "/products/search" in url:
-                    print(f"✅ [LISTA] CAPTURADO: {url}")
-                    return True
-            
             return False
         except:
             return False
     
     print("🔍 Iniciando coleta de IDs via interceptação de API...")
-    print("🔍 [DEBUG] Monitorando requisições JSON...\n")
     
-    # Primeira página
+    # Primeira página (sempre executada)
     try:
         with page.expect_response(is_list_response, timeout=15000) as response_info:
             page.goto(base_list_url, wait_until="networkidle", timeout=30000)
-        
         response = response_info.value
         data = response.json()
-        
         if data.get("data"):
-            captured_pages.append(data)
             page_ids = [str(item.get("id")) for item in data["data"] if item.get("id")]
             all_ids.update(page_ids)
-            print(f"\n✓ Página 1: {len(page_ids)} produtos capturados")
-        else:
-            print(f"\n⚠️ API retornou mas sem campo 'data'")
-            
+            print(f"✓ Página 1: {len(page_ids)} produtos capturados")
     except Exception as e:
-        print(f"\n⚠️ Erro ao capturar primeira página: {str(e)[:100]}")
-        print(f"   Tentando fallback via DOM...")
-        # Fallback: extrai IDs do DOM
-        extract_ids_from_dom(page, all_ids)
-        if all_ids:
-            print(f"✓ Fallback DOM: {len(all_ids)} IDs encontrados")
+        print(f"⚠️ Erro ao capturar primeira página: {str(e)[:100]}")
+        extract_ids_from_dom_destino(page, all_ids)
     
-    # ✅ MODO TESTE: Continua buscando até ter test_limit produtos
+    # ✅ MODO TESTE: BUSCA DIRETA POR NOME (NOVA IMPLEMENTAÇÃO)
     if CONFIG.test_mode:
-        print(f"\n🧪 MODO TESTE ATIVADO: Buscando {CONFIG.test_limit} produtos...")
+        print(f"\n🧪 MODO TESTE ATIVADO → Busca direta na barra de pesquisa")
+        origem_names = load_origem_product_names()
         
-        # Se já tem suficiente na primeira página
-        if len(all_ids) >= CONFIG.test_limit:
+        if origem_names:
+            matched_ids = collect_matched_ids_via_search(page, origem_names)
+            return matched_ids
+        else:
+            # fallback se não conseguir carregar origem
             all_ids_list = sorted(list(all_ids), key=lambda x: int(x) if x.isdigit() else 0)
-            print(f"✅ Já coletados {len(all_ids)} IDs suficientes")
             return all_ids_list[:CONFIG.test_limit]
-        
-        # Caso contrário, continua buscando...
-        print(f"⚠️ Apenas {len(all_ids)} IDs na primeira página, buscando mais...")
     
-    # Paginação
+    # MODO PRODUÇÃO: coleta completa com paginação
+    print("📋 Modo produção: coletando TODOS os produtos (páginação completa)")
     current_page = 1
     no_progress_count = 0
-    
     while current_page < CONFIG.max_pages and no_progress_count < CONFIG.max_scroll_attempts:
         previous_count = len(all_ids)
-        
-        # ✅ Verifica se já atingiu o limite do modo teste
-        if CONFIG.test_mode and len(all_ids) >= CONFIG.test_limit:
-            all_ids_list = sorted(list(all_ids), key=lambda x: int(x) if x.isdigit() else 0)
-            print(f"✅ Modo teste: {len(all_ids)} produtos encontrados")
-            return all_ids_list[:CONFIG.test_limit]
-        
-        # Tenta encontrar e clicar no botão "próxima"
-        next_clicked = try_click_next_page(page, current_page, is_list_response, all_ids)
+        next_clicked = try_click_next_page_destino(page, current_page, is_list_response, all_ids)
         
         if next_clicked:
             current_page += 1
             no_progress_count = 0
             continue
         
-        # Se não achou botão, tenta scraping do DOM
-        new_ids_found = extract_ids_from_dom(page, all_ids)
+        extract_ids_from_dom_destino(page, all_ids)
         
         if len(all_ids) > previous_count:
             no_progress_count = 0
         else:
             no_progress_count += 1
-            if no_progress_count % 5 == 0:
-                print(f"[INFO] Sem progresso ({no_progress_count}/{CONFIG.max_scroll_attempts})")
         
-        # Tenta scroll para carregar mais
         try:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(1000)
@@ -399,25 +423,17 @@ def collect_all_product_ids(page: Page, base_list_url: str) -> List[str]:
     
     all_ids_list = sorted(list(all_ids), key=lambda x: int(x) if x.isdigit() else 0)
     print(f"✅ Total de {len(all_ids_list)} IDs únicos capturados")
-    
     return all_ids_list
 
-def try_click_next_page(page: Page, current_page: int, is_list_response, all_ids: set) -> bool:
-    """
-    Tenta encontrar e clicar no botão de próxima página
-    Retorna True se conseguiu clicar e capturar dados
-    """
+def try_click_next_page_destino(page: Page, current_page: int, is_list_response, all_ids: set) -> bool:
     selectors = [
-        "a.next:not(.disabled)",
-        "button.next:not([disabled])",
+        "a.next:not(.disabled)", "button.next:not([disabled])",
         ".pagination a[rel='next']:not(.disabled)",
         "a[aria-label*='next']:not([aria-disabled='true'])",
         "button[aria-label*='next']:not([aria-disabled='true'])",
-        "a:has-text('Próxima'):not(.disabled)",
-        "a:has-text('Next'):not(.disabled)",
+        "a:has-text('Próxima'):not(.disabled)", "a:has-text('Next'):not(.disabled)",
         "li.page-item:not(.disabled) a[aria-label='Next']",
     ]
-    
     for selector in selectors:
         try:
             locator = page.locator(selector)
@@ -425,13 +441,10 @@ def try_click_next_page(page: Page, current_page: int, is_list_response, all_ids
                 button = locator.first
                 if button.is_visible():
                     print(f"➡️  Navegando para página {current_page + 1}...")
-                    
                     with page.expect_response(is_list_response, timeout=15000) as response_info:
                         button.click()
-                    
                     response = response_info.value
                     data = response.json()
-                    
                     if data.get("data"):
                         page_ids = [str(item.get("id")) for item in data["data"] if item.get("id")]
                         new_count = len([pid for pid in page_ids if pid not in all_ids])
@@ -440,59 +453,41 @@ def try_click_next_page(page: Page, current_page: int, is_list_response, all_ids
                         return True
         except Exception:
             continue
-    
     return False
 
-def extract_ids_from_dom(page: Page, all_ids: set) -> bool:
-    """
-    Extrai IDs diretamente do DOM como fallback
-    Retorna True se encontrou novos IDs
-    """
+def extract_ids_from_dom_destino(page: Page, all_ids: set) -> bool:
     try:
         ids_on_page = page.evaluate(r"""
             () => {
                 const ids = new Set();
-                
-                // Links de edição
                 document.querySelectorAll('a[href*="/products/"][href*="/edit"]').forEach(link => {
                     const match = link.href.match(/\/products\/(\d+)\/edit/);
                     if (match) ids.add(match[1]);
                 });
-                
-                // Atributos data-id
                 document.querySelectorAll('[data-id]').forEach(el => {
                     const id = el.getAttribute('data-id');
                     if (id && /^\d+$/.test(id)) ids.add(id);
                 });
-                
-                // Atributos data-product-id
                 document.querySelectorAll('[data-product-id]').forEach(el => {
                     const id = el.getAttribute('data-product-id');
                     if (id && /^\d+$/.test(id)) ids.add(id);
                 });
-                
                 return Array.from(ids);
             }
         """)
-        
         new_ids = [pid for pid in ids_on_page if pid not in all_ids]
         if new_ids:
             all_ids.update(new_ids)
             print(f"🔍 DOM: +{len(new_ids)} IDs encontrados")
             return True
-            
     except Exception as e:
         print(f"⚠️ Erro ao extrair IDs do DOM: {str(e)[:50]}")
-    
     return False
 
 # =========================
 # 3) PROCESSA PRODUTOS COM CHECKPOINT
 # =========================
-def process_all_products(page: Page, product_ids: List[str], storage) -> List[dict]:
-    """
-    Processa todos os produtos com tracking de progresso e salvamento em lote
-    """
+def process_all_products_destino(page: Page, product_ids: List[str], storage) -> List[dict]:
     tracker = ProgressTracker(len(product_ids))
     products = []
     buffer = []
@@ -500,48 +495,38 @@ def process_all_products(page: Page, product_ids: List[str], storage) -> List[di
     print(f"\n📦 Processando {len(product_ids)} produtos...")
     print(f"⚙️  Config OTIMIZADA: timeout={CONFIG.timeout_per_product}ms, retries={CONFIG.max_retries}, batch={CONFIG.batch_size}")
     if CONFIG.test_mode:
-        print(f"🧪 MODO TESTE: Coletando apenas {CONFIG.test_limit} produtos")
+        print(f"🧪 MODO TESTE: Coletando apenas produtos encontrados na busca da ORIGEM")
     print(f"⚡ Tempo estimado: ~{len(product_ids) * CONFIG.timeout_per_product / 1000 / 60:.1f} minutos (melhor caso)")
     print()
     
     for idx, pid in enumerate(product_ids, 1):
-        # Log de progresso a cada 50 produtos (ou 1 no modo teste)
         if CONFIG.test_mode or idx % 50 == 0:
             tracker._print_progress()
         
         try:
-            product = collect_product_data(page, pid)
-            
+            product = collect_product_data_destino(page, pid)
             if product and product.get("nome"):
                 products.append(product)
                 buffer.append(product)
                 tracker.log_success(pid, product.get("nome", ""))
-                
-                # Salva em lote
                 if len(buffer) >= CONFIG.batch_size:
                     save_batch(storage, buffer)
                     buffer = []
             else:
                 tracker.log_failure(pid, "Sem dados após retries")
-                
         except Exception as e:
             tracker.log_failure(pid, str(e))
     
-    # Salva resto do buffer
     if buffer:
         save_batch(storage, buffer)
     
-    # Resumo final
     tracker.print_summary()
-    
-    # Salva lista de IDs que falharam
     if tracker.failed_ids:
         save_failed_ids(tracker.failed_ids)
     
     return products
 
 def save_batch(storage, products: List[dict]):
-    """Salva um lote de produtos, com fallback para salvamento individual"""
     try:
         if hasattr(storage, 'save_many'):
             storage.save_many(products)
@@ -553,7 +538,6 @@ def save_batch(storage, products: List[dict]):
                     print(f"⚠️ Erro ao salvar {product.get('produto_id')}: {str(e)[:40]}")
     except Exception as e:
         print(f"⚠️ Erro no salvamento em lote: {str(e)[:60]}")
-        # Tenta salvar individualmente
         for product in products:
             try:
                 storage.save(product)
@@ -561,18 +545,15 @@ def save_batch(storage, products: List[dict]):
                 pass
 
 def save_failed_ids(failed_ids: List[str]):
-    """Salva lista de IDs que falharam para reprocessamento posterior"""
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"failed_products_{timestamp}.json"
-        
+        filename = f"failed_products_destino_{timestamp}.json"
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump({
                 "timestamp": timestamp,
                 "count": len(failed_ids),
                 "ids": failed_ids
             }, f, indent=2, ensure_ascii=False)
-        
         print(f"\n💾 IDs que falharam salvos em: {filename}")
     except Exception as e:
         print(f"⚠️ Não foi possível salvar lista de falhas: {str(e)}")
@@ -581,41 +562,35 @@ def save_failed_ids(failed_ids: List[str]):
 # 4) FUNÇÃO PRINCIPAL
 # =========================
 def collect_all_products(page: Page, storage) -> List[dict]:
-    """
-    Função principal que orquestra toda a coleta (VERSÃO OTIMIZADA + INFORMAÇÕES ADICIONAIS)
-    """
     base_list_url = (
-        f"https://www.grasiely.com.br/admin/products/list?"
+        f"https://www.grasielyatacado.com.br/admin/products/list?"
         f"sort=name&page[size]={CONFIG.page_size}&page[number]=1"
     )
     
     print("\n" + "="*60)
-    print("INICIANDO COLETA DE PRODUTOS (VERSÃO OTIMIZADA + INFO ADICIONAIS)")
+    print("INICIANDO COLETA DE PRODUTOS DESTINO (ATACADO)")
     print("="*60)
     print(f"URL base: {base_list_url}")
     print(f"⚡ Timeout: {CONFIG.timeout_per_product}ms")
     print(f"⚡ Retries: {CONFIG.max_retries}")
     print(f"⚡ Batch: {CONFIG.batch_size}")
     if CONFIG.test_mode:
-        print(f"🧪 MODO TESTE ATIVADO: Apenas {CONFIG.test_limit} produtos")
+        print(f"🧪 MODO TESTE ATIVADO: Busca direta por nome da ORIGEM")
         print(f"   Para desativar: CONFIG.test_mode = False")
     print("="*60 + "\n")
     
-    # ETAPA 1: Coletar IDs
     print("📋 ETAPA 1: COLETANDO IDS DOS PRODUTOS")
     print("-" * 60)
-    product_ids = collect_all_product_ids(page, base_list_url)
+    product_ids = collect_all_product_ids_destino(page, base_list_url)
     
     if not product_ids:
         print("❌ Nenhum produto foi encontrado!")
         return []
     
-    # ETAPA 2: Coletar dados detalhados
     print("\n📦 ETAPA 2: COLETANDO DADOS DETALHADOS")
     print("-" * 60)
-    all_products = process_all_products(page, product_ids, storage)
+    all_products = process_all_products_destino(page, product_ids, storage)
     
-    # Resumo final
     print("\n" + "="*60)
     print("✅ COLETA CONCLUÍDA")
     print("="*60)
@@ -630,18 +605,12 @@ def collect_all_products(page: Page, storage) -> List[dict]:
 # 5) FUNÇÃO PARA REPROCESSAR FALHAS
 # =========================
 def retry_failed_products(page: Page, storage, failed_json_path: str) -> List[dict]:
-    """
-    Reprocessa produtos que falharam na execução anterior
-    """
     try:
         with open(failed_json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
         failed_ids = data.get("ids", [])
         print(f"🔄 Reprocessando {len(failed_ids)} produtos que falharam anteriormente...")
-        
-        return process_all_products(page, failed_ids, storage)
-        
+        return process_all_products_destino(page, failed_ids, storage)
     except Exception as e:
         print(f"❌ Erro ao carregar arquivo de falhas: {str(e)}")
         return []

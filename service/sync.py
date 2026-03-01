@@ -1,75 +1,146 @@
 # service/sync.py
 import json
-from service.auth import authenticate
-from service.scraper import collect_all_products  # só pra reaproveitar se precisar
+import time
+from typing import Dict
 
-def products_by_name(storage) -> dict:
-    """Carrega JSON e indexa por nome (chave única)"""
+def normalize_name(name: str) -> str:
+    """Normaliza nome para comparação confiável"""
+    if not name:
+        return ""
+    return " ".join(name.strip().split()).lower()
+
+
+def products_by_name(storage) -> Dict[str, dict]:
+    """Carrega JSON e indexa por nome normalizado"""
     data = storage.read_all()
-    return {p["nome"].strip().lower(): p for p in data if p.get("nome")}
+    return {normalize_name(p.get("nome", "")): p for p in data if p.get("nome")}
 
-def run_sync(context, storage_origem, storage_destino, origem_url, user, password, cookie_files):
+
+def prepare_update_payload(origem: dict, destino: dict) -> dict:
+    """
+    Atualiza TUDO com dados da ORIGEM
+    EXCETO:
+      - produto_id (não pode enviar)
+      - seo_preview.link (mantém o link do Atacado)
+    """
+    payload = {
+        "name": origem.get("nome"),
+        "price": origem.get("preco"),
+        "description": origem.get("descricao"),
+        "stock": origem.get("estoque"),
+        "minimum_stock": origem.get("estoque_minimo"),
+        "category_name": origem.get("categoria"),
+        "reference": origem.get("referencia"),
+        "weight": origem.get("peso"),
+        "height": origem.get("altura"),
+        "width": origem.get("largura"),
+        "length": origem.get("comprimento"),
+        "active": origem.get("ativo"),
+        "visible": origem.get("visivel"),
+        "minimum_stock_alert": origem.get("notificacao_estoque_baixo"),
+        "included_items": origem.get("itens_inclusos", ""),
+        "additional_message": origem.get("mensagem_adicional", ""),
+        "warranty": origem.get("tempo_garantia"),
+        "AdditionalInfos": origem.get("informacoes_adicionais", []),
+    }
+
+    # SEO: mantemos o link do DESTINO (Atacado)
+    destino_link = destino.get("seo_preview", {}).get("link")
+    if destino_link:
+        payload["url"] = {"https": destino_link}
+
+    # Imagem principal (da origem)
+    if origem.get("imagem_url"):
+        payload["ProductImage"] = [{"https": origem["imagem_url"]}]
+
+    return payload
+
+
+def update_product_in_destino(page, destino_id: str, payload: dict) -> bool:
+    """Faz o PUT real no Atacado"""
+    try:
+        url = f"https://www.grasielyatacado.com.br/admin/products/{destino_id}"
+
+        response = page.request.put(
+            url=url,
+            data=json.dumps({"data": payload}),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-Requested-With": "XMLHttpRequest"
+            }
+        )
+
+        if response.ok:
+            print(f"      ✅ SUCESSO → ID {destino_id}")
+            return True
+        else:
+            print(f"      ❌ FALHA {response.status} → {response.text[:300]}")
+            return False
+
+    except Exception as e:
+        print(f"      ❌ Erro de requisição: {e}")
+        return False
+
+
+# ========================= FUNÇÃO PRINCIPAL =========================
+def run_sync(context, storage_origem, storage_destino, origem_url, user, password):
+    print("\n" + "=" * 70)
+    print("🔄 SYNC: ORIGEM → DESTINO (Atualizando Atacado com dados da Grasiely)")
+    print("=" * 70)
+
     origem_dict = products_by_name(storage_origem)
     destino_dict = products_by_name(storage_destino)
 
-    comuns = set(origem_dict.keys()) & set(destino_dict.keys())
-    print(f"✅ {len(comuns)} produtos com nome idêntico encontrados")
+    print(f"📊 Origem   → {len(origem_dict)} produtos")
+    print(f"📊 Destino  → {len(destino_dict)} produtos")
 
-    to_update = []
-    for nome in comuns:
-        o = origem_dict[nome]
-        d = destino_dict[nome]
+    matches = []
+    for nome_norm, prod_origem in origem_dict.items():
+        if nome_norm in destino_dict:
+            prod_destino = destino_dict[nome_norm]
+            matches.append((prod_origem, prod_destino))
+            print(f"   ✅ Match: {prod_origem.get('nome')[:70]}...")
 
-        # Comparação ignorando APENAS o link de SEO
-        seo_link_origem = o.get("seo_preview", {}).get("link", "")
-        seo_link_destino = d.get("seo_preview", {}).get("link", "")
+    print(f"\n🔍 {len(matches)} produtos encontrados para sincronizar")
 
-        # Remove temporariamente o SEO pra comparar o resto
-        o_clean = {k: v for k, v in o.items() if k != "seo_preview"}
-        d_clean = {k: v for k, v in d.items() if k != "seo_preview"}
-
-        if o_clean != d_clean:
-            to_update.append((o["produto_id"], d))  # (id_origem, dados_destino)
-
-    if not to_update:
-        print("🎉 Tudo já está sincronizado! Nada pra alterar.")
+    if not matches:
+        print("❌ Nenhum produto em comum.")
         return
 
-    print(f"🔄 {len(to_update)} produtos precisam ser atualizados na ORIGEM...")
+    # Login NO DESTINO (Atacado) - usando o novo authenticate
+    print("\n🔑 Logando no site do Atacado...")
+    from .auth import authenticate   # import relativo
 
-    # Login na origem (stealth igual antes)
-    page = authenticate(context, origem_url, user, password, cookie_files)
+    # Cria uma nova página a partir do contexto
+    page = context.new_page()
+    page = authenticate(
+        page,
+        "https://www.grasielyatacado.com.br/admin/products/list",
+        user,
+        password
+    )
+
     if not page:
-        print("❌ Falha no login da origem")
+        print("❌ Falha no login do Atacado")
         return
 
-    # ==================== UPDATE REAL ====================
-    for produto_id, dados_destino in to_update:
-        try:
-            # Pega o full_data do destino
-            full_destino = dados_destino.get("full_data")
-            if not full_destino:
-                print(f"⚠️ Produto {produto_id} sem full_data (rode coleta novamente)")
-                continue
+    # Atualiza um por um
+    success = 0
+    for idx, (prod_origem, prod_destino) in enumerate(matches, 1):
+        destino_id = prod_destino.get("produto_id")
+        nome = prod_origem.get("nome", "Sem nome")[:60]
 
-            # Mantém o SEO link da ORIGEM (exceção que você pediu)
-            if "url" in full_destino and isinstance(full_destino["url"], dict):
-                full_destino["url"]["https"] = dados_destino.get("seo_preview", {}).get("link") or full_destino["url"].get("https")
+        print(f"[{idx}/{len(matches)}] Atualizando → {nome} (ID destino: {destino_id})")
 
-            # AQUI VAI O CÓDIGO DE UPDATE (você só precisa descobrir 1x o endpoint)
-            # Exemplo (substitua pelos dados reais que você vai me passar):
-            response = page.request.put(
-                f"https://www.grasiely.com.br/admin/products/{produto_id}",  # ← MUDE AQUI
-                data=json.dumps({"data": full_destino}),                 # ← ou só full_destino
-                headers={"Content-Type": "application/json", "Accept": "application/json"}
-            )
+        payload = prepare_update_payload(prod_origem, prod_destino)
 
-            if response.ok:
-                print(f"✅ Atualizado: {produto_id}")
-            else:
-                print(f"❌ Falha {produto_id} → {response.status} {response.text[:100]}")
+        if update_product_in_destino(page, destino_id, payload):
+            success += 1
 
-        except Exception as e:
-            print(f"❌ Erro ao atualizar {produto_id}: {e}")
+        time.sleep(1.3)  # delay seguro
 
-    print("🎉 SYNC CONCLUÍDO!")
+    print("\n" + "=" * 60)
+    print(f"🎉 SYNC CONCLUÍDO!")
+    print(f"✅ {success}/{len(matches)} produtos atualizados no Atacado")
+    print("=" * 60)
