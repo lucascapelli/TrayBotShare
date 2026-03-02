@@ -4,6 +4,14 @@
 # para encontrar matches, depois abre /edit só dos que deram match, faz PUT.
 #
 # STEALTH: busca no search bar (humano), delays gaussianos, rate limit.
+#
+# MODO TESTE: processa APENAS produtos que possuem informações adicionais,
+#             pra validar que as infos estão sendo vinculadas corretamente.
+#             Após validação, remover o filtro pra rodar com todos.
+#
+# FIX OBRIGATÓRIO: "Opção Banho" → "Opção do Banho"
+#   A string "Opção Banho" causa travamento no servidor da Tray (painel e API).
+#   Toda info adicional com esse nome DEVE ser renomeada antes do envio.
 
 import json
 import logging
@@ -23,6 +31,38 @@ logger = logging.getLogger("sync")
 RATE_LIMIT = 5          # Máx. de PUTs por execução (alterar quando ok)
 DESTINO_BASE = "https://www.grasielyatacado.com.br"
 ORIGEM_JSON_PATH = "produtos/ProdutosOrigem.json"
+
+# Modo teste: só processa produtos COM informações adicionais
+# Setar False quando quiser rodar com todos os produtos
+MODO_TESTE_APENAS_COM_INFOS = True
+
+
+# ---------------------------------------------------------------------------
+# FIX OBRIGATÓRIO: Renomeação "Opção Banho" → "Opção do Banho"
+# Causa travamento no servidor da Tray (painel + API).
+# ---------------------------------------------------------------------------
+def _fix_opcao_banho(infos: list) -> list:
+    """
+    Percorre lista de infos adicionais e renomeia qualquer ocorrência de
+    "Opção Banho" (case-insensitive) para "Opção do Banho".
+    
+    IMPORTANTE: NÃO REMOVER — "Opção Banho" trava o servidor da Tray.
+    """
+    if not infos:
+        return infos
+
+    fixed = []
+    for info in infos:
+        info_copy = dict(info)  # não modificar o original
+        nome = (info_copy.get("nome") or "").strip()
+        if nome.lower() == "opção banho":
+            logger.warning(
+                "⚠️ FIX BANHO: Renomeando '%s' → 'Opção do Banho' "
+                "(string original causa travamento na Tray)", nome
+            )
+            info_copy["nome"] = "Opção do Banho"
+        fixed.append(info_copy)
+    return fixed
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +112,22 @@ def _load_origem_products() -> List[dict]:
     except Exception as e:
         logger.error("Erro ao carregar ORIGEM: %s", e)
         return []
+
+
+def _filter_produtos_com_infos(produtos: List[dict]) -> List[dict]:
+    """
+    MODO TESTE: retorna apenas produtos que possuem informações adicionais
+    não-vazias, pra validar que o fluxo de vinculação está funcionando.
+    """
+    com_infos = [
+        p for p in produtos
+        if p.get("informacoes_adicionais") and len(p["informacoes_adicionais"]) > 0
+    ]
+    logger.info(
+        "MODO TESTE: %d/%d produtos possuem informações adicionais",
+        len(com_infos), len(produtos),
+    )
+    return com_infos
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +307,9 @@ def _fetch_destino_info_map(page: Page, auth_token: str) -> Dict[str, str]:
     nome_normalizado → destino_id
     
     Ex: "tamanho do aro" → "15"
+    
+    NOTA: O mapa já considera o fix "Opção do Banho" — busca pela versão
+    corrigida no DESTINO.
     """
     api_url = f"{DESTINO_BASE}/admin/api/additional-info"
     headers = {
@@ -385,11 +444,16 @@ def _attach_additional_infos_to_product(
     Vincula infos adicionais ao produto via POST PHP.
     Usa fetch() de dentro da página pra herdar cookies/sessão do browser.
     
+    IMPORTANTE: Aplica _fix_opcao_banho() ANTES de processar as infos.
+    
     Endpoint: /mvc/adm/additional_product_info/additional_product_info/edit/{product_id}
     Payload exato capturado do browser.
     """
     if not origem_infos or not info_map:
         return 0, 0
+
+    # *** FIX OBRIGATÓRIO: Renomear "Opção Banho" → "Opção do Banho" ***
+    origem_infos = _fix_opcao_banho(origem_infos)
 
     # Coletar IDs do DESTINO que precisam ser vinculados
     destino_info_ids = []
@@ -529,16 +593,20 @@ def run_sync(
     cookies_origem: list,
 ):
     """
-    Fluxo:
+    Fluxo (MODO TESTE):
     1. Carrega ProdutosOrigem.json
-    2. Busca cada nome da ORIGEM no search bar do DESTINO (stealth, igual scraperDestino)
-    3. Para nos primeiros RATE_LIMIT matches
-    4. Abre /edit só desses → pega JSON completo (pra preservar seo_preview.link)
-    5. PUT com dados da ORIGEM
+    2. Filtra APENAS produtos com informações adicionais (modo teste)
+    3. Busca cada nome no search bar do DESTINO (stealth)
+    4. Para nos primeiros RATE_LIMIT matches
+    5. Abre /edit → pega JSON completo (preserva seo_preview.link)
+    6. PUT com dados da ORIGEM
+    7. POST pra vincular infos adicionais (com fix "Opção Banho")
     """
     print("\n" + "=" * 70)
     print("🔄 SYNC: ORIGEM → DESTINO")
     print(f"   Rate limit: {RATE_LIMIT} produtos por execução")
+    if MODO_TESTE_APENAS_COM_INFOS:
+        print("   ⚙️  MODO TESTE: apenas produtos COM informações adicionais")
     print("=" * 70)
 
     # 1) Carregar ORIGEM
@@ -547,6 +615,26 @@ def run_sync(
         print("❌ Nenhum produto na ORIGEM. Encerrando.")
         return
 
+    total_origem = len(origem_products)
+
+    # 2) MODO TESTE: filtrar apenas produtos com informações adicionais
+    if MODO_TESTE_APENAS_COM_INFOS:
+        origem_products = _filter_produtos_com_infos(origem_products)
+        if not origem_products:
+            print("❌ Nenhum produto da ORIGEM possui informações adicionais. Encerrando.")
+            return
+        print(f"\n   📋 {len(origem_products)}/{total_origem} produtos têm infos adicionais")
+
+        # Mostra quais infos cada produto tem (debug)
+        for p in origem_products[:10]:  # mostra só os 10 primeiros pra não poluir
+            nome = (p.get("nome") or "")[:50]
+            infos = p.get("informacoes_adicionais", [])
+            nomes_infos = [i.get("nome", "?") for i in infos]
+            print(f"      • {nome} → {nomes_infos}")
+        if len(origem_products) > 10:
+            print(f"      ... e mais {len(origem_products) - 10}")
+        print()
+
     # Página do contexto DESTINO
     pages = context.pages
     if not pages:
@@ -554,7 +642,7 @@ def run_sync(
         return
     page = pages[0]
 
-    # 2) Buscar matches via search bar (stealth)
+    # 3) Buscar matches via search bar (stealth)
     print(f"\n🔍 ETAPA 1: Buscando matches na barra de pesquisa do DESTINO...")
     print(f"   ({len(origem_products)} nomes da ORIGEM, parando em {RATE_LIMIT} matches)")
     print("-" * 70)
@@ -572,10 +660,11 @@ def run_sync(
     print(f"🔒 Processando {len(to_process)} (rate limit = {RATE_LIMIT})\n")
 
     for i, m in enumerate(to_process, 1):
-        print(f"   {i}. [{m['destino_id']}] {m['destino_name'][:65]}")
+        infos_count = len(m["origem_product"].get("informacoes_adicionais", []))
+        print(f"   {i}. [{m['destino_id']}] {m['destino_name'][:55]} ({infos_count} infos)")
     print()
 
-    # 3) Buscar mapa de infos adicionais do DESTINO (antes de processar)
+    # 4) Buscar mapa de infos adicionais do DESTINO (antes de processar)
     #    Precisa de token — vamos capturar abrindo o primeiro produto
     print("📋 ETAPA 2: Construindo mapa de informações adicionais do DESTINO...")
     print("-" * 70)
@@ -590,17 +679,24 @@ def run_sync(
         info_map = _fetch_destino_info_map(page, first_token)
         if info_map:
             print(f"   ✅ {len(info_map)} infos adicionais mapeadas no DESTINO")
+            # Debug: mostrar mapa
+            for nome, did in list(info_map.items())[:15]:
+                print(f"      '{nome}' → ID {did}")
+            if len(info_map) > 15:
+                print(f"      ... e mais {len(info_map) - 15}")
         else:
             print(f"   ⚠️ Nenhuma info adicional encontrada no DESTINO")
     else:
         print(f"   ⚠️ Token não capturado — infos adicionais não serão sincronizadas")
 
-    # 4) Processar: abrir /edit → pegar JSON completo → PUT
+    # 5) Processar: abrir /edit → pegar JSON completo → PUT → POST infos
     print(f"\n📦 ETAPA 3: Atualizando produtos...")
     print("-" * 70)
 
     updated = 0
     errors = 0
+    infos_ok_total = 0
+    infos_fail_total = 0
     update_log = []
 
     for idx, match in enumerate(to_process, 1):
@@ -646,25 +742,35 @@ def run_sync(
         print(f"   📤 Enviando atualização...")
         ok, status, body = _put_product(page, pid, payload, auth_token or "")
 
+        ok_infos = 0
+        fail_infos = 0
+
         if ok:
             updated += 1
             print(f"   ✅ Atualizado com sucesso (Status {status})")
 
             # Vincular infos adicionais (POST separado)
+            # *** Fix "Opção Banho" é aplicado dentro de _attach_additional_infos_to_product ***
             origem_infos = origem_prod.get("informacoes_adicionais", [])
             if origem_infos and info_map:
                 print(f"   📎 Vinculando {len(origem_infos)} infos adicionais...")
                 ok_infos, fail_infos = _attach_additional_infos_to_product(
                     page, pid, origem_infos, info_map,
                 )
+                infos_ok_total += ok_infos
+                infos_fail_total += fail_infos
                 if ok_infos > 0:
                     print(f"   ✅ {ok_infos} infos adicionais vinculadas")
                 if fail_infos > 0:
                     print(f"   ⚠️ {fail_infos} infos adicionais falharam")
+            elif origem_infos and not info_map:
+                print(f"   ⚠️ Produto tem {len(origem_infos)} infos mas mapa do DESTINO está vazio")
 
             update_log.append({
                 "id": pid, "nome": name, "status": status,
                 "resultado": "sucesso",
+                "infos_vinculadas": ok_infos,
+                "infos_falhas": fail_infos,
             })
         else:
             errors += 1
@@ -678,20 +784,27 @@ def run_sync(
         # Pausa stealth pós-PUT
         _post_put_delay()
 
-    # 4) Resumo
+    # 6) Resumo
     print("\n" + "=" * 70)
     print("✅ SYNC FINALIZADO!")
-    print(f"   Produtos na ORIGEM:       {len(origem_products)}")
+    print(f"   Produtos na ORIGEM:       {total_origem}")
+    if MODO_TESTE_APENAS_COM_INFOS:
+        print(f"   Com infos adicionais:     {len(origem_products)}")
     print(f"   Matches encontrados:      {len(matches)}")
     print(f"   Processados (rate limit): {len(to_process)}")
     print(f"   Atualizados:              {updated}")
     print(f"   Erros:                    {errors}")
+    print(f"   Infos vinculadas (total): {infos_ok_total}")
+    print(f"   Infos com falha (total):  {infos_fail_total}")
 
     if update_log:
         print(f"\n   📝 Detalhes:")
         for entry in update_log:
             icon = "✅" if entry["resultado"] == "sucesso" else "❌"
-            print(f"      {icon} [{entry['id']}] {entry['nome'][:55]}")
+            infos_str = ""
+            if entry.get("infos_vinculadas", 0) > 0 or entry.get("infos_falhas", 0) > 0:
+                infos_str = f" | infos: {entry.get('infos_vinculadas', 0)}ok/{entry.get('infos_falhas', 0)}fail"
+            print(f"      {icon} [{entry['id']}] {entry['nome'][:50]}{infos_str}")
 
         try:
             with open("produtos/sync_log.json", "w", encoding="utf-8") as f:
@@ -702,9 +815,13 @@ def run_sync(
 
     remaining = len(origem_products) - len(matches)
     if remaining > 0:
-        print(f"\n   ⏳ {remaining} produtos da ORIGEM sem match no DESTINO.")
+        print(f"\n   ⏳ {remaining} produtos da ORIGEM (com infos) sem match no DESTINO.")
 
     if len(matches) > RATE_LIMIT:
         print(f"   ⏳ {len(matches) - RATE_LIMIT} matches restantes. Aumente RATE_LIMIT pra processar mais.")
+
+    if MODO_TESTE_APENAS_COM_INFOS:
+        print(f"\n   ℹ️  MODO TESTE ativo — só produtos com infos adicionais foram processados.")
+        print(f"   ℹ️  Para rodar com TODOS, setar MODO_TESTE_APENAS_COM_INFOS = False")
 
     print("=" * 70)
