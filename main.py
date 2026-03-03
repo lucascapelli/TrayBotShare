@@ -259,7 +259,7 @@ def action_sync_additional(browser: Browser) -> None:
 
 
 def action_fix_produto_47(browser: Browser) -> None:
-    logger.info("Executando fix temporário do produto 47 no DESTINO...")
+    logger.info("Executando repair por referência do produto 47 no DESTINO (PUT + POST + POST)...")
     ctx, page = auth_in_context(
         browser, DESTINO_URL, TARGET_USER, TARGET_PASS, COOKIES_DESTINO, "DESTINO"
     )
@@ -283,7 +283,7 @@ MENU = """
   2  Colher dados DESTINO
   3  Sync ORIGEM → DESTINO (atualizar produtos)
   4  Sync Info Adicionais (origem → destino)
-    47 Fix temporário produto 47 (DESTINO)
+        47 Repair produto 47 por referência (DESTINO)
   0  Sair
 ----------------------------------------------------------------------"""
 

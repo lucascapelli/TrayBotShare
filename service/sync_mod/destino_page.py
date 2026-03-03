@@ -124,6 +124,27 @@ def fetch_product_and_token(page: Page, product_id: str, logger) -> Tuple[Option
     if auth_token and not auth_token.lower().startswith("bearer "):
         auth_token = f"Bearer {auth_token}"
 
+    if auth_token:
+        try:
+            resp = page.request.get(
+                f"{DESTINO_BASE}/admin/api/products/{product_id}",
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": auth_token,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": f"{DESTINO_BASE}/admin/products/{product_id}/edit",
+                },
+            )
+            if resp.status == 200:
+                payload = resp.json()
+                if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+                    detail_json = payload.get("data")
+                    logger.info("📥 JSON do produto %s capturado via GET /admin/api/products/{id}", product_id)
+            else:
+                logger.warning("GET /admin/api/products/%s retornou status %d", product_id, resp.status)
+        except Exception as exc:
+            logger.warning("Erro no GET /admin/api/products/%s: %s", product_id, exc)
+
     if detail_json:
         logger.info("📄 JSON do produto %s capturado", product_id)
     else:

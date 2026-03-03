@@ -5,9 +5,20 @@ logger = logging.getLogger("sync")
 
 
 def fix_opcao_banho_str(nome: str) -> str:
-    if nome and nome.strip().lower() == "opção banho":
-        logger.warning("⚠️ FIX BANHO: '%s' → 'Opção do Banho'", nome)
-        return "Opção do Banho"
+    if not nome:
+        return nome
+
+    normalized = " ".join(nome.strip().split()).lower()
+    aliases = {
+        "opção banho": "Opção do Banho",
+        "opcao banho": "Opção do Banho",
+        "escolher opção do banho": "Opção do Banho",
+        "escolher opcao do banho": "Opção do Banho",
+    }
+    canonical = aliases.get(normalized)
+    if canonical:
+        logger.warning("⚠️ FIX BANHO: '%s' → '%s'", nome, canonical)
+        return canonical
     return nome
 
 

@@ -3,11 +3,27 @@ import random
 import re
 import time
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
 from patchright.sync_api import Page
 
 from .config import DESTINO_BASE
 from .domain import api_headers, normalize
+
+
+def get_product_details(page: Page, product_id: str, token: str, logger) -> Optional[dict]:
+    url = f"{DESTINO_BASE}/admin/api/products/{product_id}"
+    try:
+        resp = page.request.get(url, headers=api_headers(token))
+        if resp.status != 200:
+            logger.warning("GET product %s falhou: status %d", product_id, resp.status)
+            return None
+        payload = resp.json()
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            return payload.get("data")
+    except Exception as exc:
+        logger.warning("Erro GET product %s: %s", product_id, exc)
+    return None
 
 
 def put_product(page: Page, product_id: str, payload: dict, token: str) -> Tuple[bool, int, str]:
@@ -62,6 +78,186 @@ def fetch_all_additional_infos(page: Page, token: str, logger) -> Dict[str, str]
 
     logger.info("📋 Catálogo de infos adicionais DESTINO: %d entradas", len(info_map))
     return info_map
+
+
+def fetch_all_additional_infos_catalog(page: Page, token: str, logger) -> Dict[str, dict]:
+    catalog: Dict[str, dict] = {}
+    page_num = 1
+
+    while True:
+        url = f"{DESTINO_BASE}/admin/api/additional-info?sort=id&page[size]=25&page[number]={page_num}"
+        try:
+            resp = page.request.get(url, headers=api_headers(token))
+            if resp.status != 200:
+                logger.warning("Falha GET additional-info catálogo pág %d: status %d", page_num, resp.status)
+                break
+
+            data = resp.json()
+            items = data.get("data", [])
+            if not items:
+                break
+
+            for item in items:
+                name = (item.get("custom_name") or item.get("name") or "").strip()
+                item_id = item.get("id")
+                if not name or not item_id:
+                    continue
+
+                option_map: Dict[str, str] = {}
+                options = item.get("options")
+
+                if isinstance(options, list):
+                    for option in options:
+                        if not isinstance(option, dict):
+                            continue
+                        option_name = (option.get("name") or "").strip()
+                        option_id = option.get("id")
+                        if option_name and option_id:
+                            option_map[normalize(option_name)] = str(option_id)
+                elif isinstance(options, dict):
+                    for option in options.values():
+                        if not isinstance(option, dict):
+                            continue
+                        option_name = (option.get("name") or "").strip()
+                        option_id = option.get("id")
+                        if option_name and option_id:
+                            option_map[normalize(option_name)] = str(option_id)
+
+                catalog[normalize(name)] = {
+                    "id": str(item_id),
+                    "name": name,
+                    "option_map": option_map,
+                }
+
+            total = data.get("paging", {}).get("total", 0)
+            total_pages = max(1, (total + 24) // 25)
+            if page_num >= total_pages:
+                break
+            page_num += 1
+            time.sleep(random.uniform(0.3, 0.6))
+        except Exception as exc:
+            logger.warning("Erro additional-info catálogo pág %d: %s", page_num, exc)
+            break
+
+    logger.info("📋 Catálogo rico de infos adicionais DESTINO: %d entradas", len(catalog))
+    return catalog
+
+
+def _post_form_urlencoded(page: Page, url: str, form_data: Dict[str, str], referer: str = "") -> Tuple[int, str]:
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if referer:
+        headers["Referer"] = referer
+
+    body = urlencode({k: "" if v is None else str(v) for k, v in form_data.items()})
+    try:
+        resp = page.request.post(url, data=body, headers=headers)
+        text = ""
+        try:
+            text = resp.text()[:300]
+        except Exception:
+            pass
+        return resp.status, text
+    except Exception as exc:
+        return 0, str(exc)
+
+
+def _create_additional_info_field(page: Page, info_name: str, logger) -> bool:
+    form_data = {
+        "nome_loja": info_name,
+        "nome_adm": info_name,
+        "ativa": "1",
+        "exibir_valor": "0",
+        "obrigatorio": "1",
+        "contador": "0",
+        "tipo": "S",
+        "valor": "0.00",
+        "add_total": "1",
+        "ordem": "0",
+    }
+
+    endpoints = [
+        f"{DESTINO_BASE}/adm/extras/informacao_produto_executar.php?acao=incluir",
+        f"{DESTINO_BASE}/admin/informacao_produto_executar.php?acao=incluir",
+    ]
+    referer = f"{DESTINO_BASE}/admin/#/adm/extras/informacao_produto_index.php"
+
+    for endpoint in endpoints:
+        status, body = _post_form_urlencoded(page, endpoint, form_data, referer=referer)
+        if status in (200, 201, 302):
+            logger.info("🆕 Campo Additional Info criado via %s (status %s): %s", endpoint, status, info_name)
+            return True
+        logger.warning("Falha criando campo '%s' em %s: status=%s body=%s", info_name, endpoint, status, body)
+
+    return False
+
+
+def _create_additional_info_option(page: Page, field_id: str, option_name: str, logger) -> bool:
+    endpoint = (
+        f"{DESTINO_BASE}/adm/extras/informacao_produto_index.php"
+        f"?id={field_id}&aba=opcoes&acao=adicionar"
+    )
+    form_data = {
+        "id": str(field_id),
+        "id_opcao": "0",
+        "exibicao_novo": "1",
+        "opcao": option_name,
+        "valor": "0.00",
+        "imagem": "",
+    }
+    status, body = _post_form_urlencoded(page, endpoint, form_data)
+    if status in (200, 201, 302):
+        logger.info("    🆕 Opção criada para field_id=%s: %s", field_id, option_name)
+        return True
+
+    logger.warning(
+        "    Falha criando opção '%s' em field_id=%s: status=%s body=%s",
+        option_name,
+        field_id,
+        status,
+        body,
+    )
+    return False
+
+
+def ensure_additional_info_with_options(
+    page: Page,
+    token: str,
+    info_name: str,
+    option_names: List[str],
+    logger,
+) -> Optional[dict]:
+    catalog = fetch_all_additional_infos_catalog(page, token, logger=logger)
+    normalized_name = normalize(info_name)
+    info = catalog.get(normalized_name)
+
+    if not info:
+        if not _create_additional_info_field(page, info_name, logger=logger):
+            return None
+        time.sleep(random.uniform(0.4, 0.9))
+        catalog = fetch_all_additional_infos_catalog(page, token, logger=logger)
+        info = catalog.get(normalized_name)
+        if not info:
+            logger.warning("Campo '%s' foi criado, mas não apareceu no catálogo após refresh", info_name)
+            return None
+
+    info_id = str(info.get("id"))
+    option_map = info.get("option_map") if isinstance(info.get("option_map"), dict) else {}
+
+    for option_name in option_names:
+        opt_name = (option_name or "").strip()
+        if not opt_name:
+            continue
+        if normalize(opt_name) in option_map:
+            continue
+        _create_additional_info_option(page, info_id, opt_name, logger=logger)
+
+    time.sleep(random.uniform(0.3, 0.8))
+    refreshed = fetch_all_additional_infos_catalog(page, token, logger=logger).get(normalized_name)
+    return refreshed if isinstance(refreshed, dict) else info
 
 
 def get_product_current_infos(page: Page, product_id: str, logger) -> List[str]:
@@ -135,6 +331,8 @@ def post_additional_infos(
     product_id: str,
     info_ids_to_link: List[str],
     short_delay,
+    sort_entries: Optional[List[str]] = None,
+    option_info_entries: Optional[List[str]] = None,
 ) -> Tuple[bool, str]:
     nav_url = (
         f"{DESTINO_BASE}/admin/#/mvc/adm/additional_product_info/"
@@ -152,8 +350,18 @@ def post_additional_infos(
     parts.append(f"id_produto={product_id}")
     parts.append("data%5BAdditionalProductInfo%5D%5Bherda_prazo%5D=0")
     parts.append("data%5BAdditionalProductInfo%5D%5Bprazo%5D=0")
-    for info_id in info_ids_to_link:
-        parts.append(f"sort%5B%5D={info_id}-")
+
+    if sort_entries:
+        for entry in sort_entries:
+            parts.append(f"sort%5B%5D={entry}")
+    else:
+        for info_id in info_ids_to_link:
+            parts.append(f"sort%5B%5D={info_id}-")
+
+    if option_info_entries:
+        for entry in option_info_entries:
+            parts.append(f"option_info%5B%5D={entry}")
+
     body = "&".join(parts)
 
     endpoint = (
@@ -337,6 +545,24 @@ def put_variants(page: Page, product_id: str, variants_payload: list, token: str
     url = f"{DESTINO_BASE}/admin/api/products/{product_id}/variants"
     try:
         resp = page.request.put(
+            url=url,
+            data=json.dumps({"data": variants_payload}),
+            headers=api_headers(token),
+        )
+        body = ""
+        try:
+            body = resp.text()[:500]
+        except Exception:
+            pass
+        return resp.ok, resp.status, body
+    except Exception as exc:
+        return False, 0, str(exc)
+
+
+def post_variants(page: Page, product_id: str, variants_payload: list, token: str) -> Tuple[bool, int, str]:
+    url = f"{DESTINO_BASE}/admin/api/products/{product_id}/variants"
+    try:
+        resp = page.request.post(
             url=url,
             data=json.dumps({"data": variants_payload}),
             headers=api_headers(token),
