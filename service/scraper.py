@@ -105,6 +105,25 @@ def safe_float(value, default=None) -> Optional[float]:
     except (ValueError, AttributeError):
         return default
 
+def fetch_variants_from_api(page: Page, produto_id: str) -> List[dict]:
+    """
+    Busca as variações completas do produto na API administrativa.
+    Carrega a página de edição e clica na aba de variações para acionar a API.
+    """
+    try:
+        with page.expect_response(lambda r: '/admin/api/products-variants' in r.url) as response_info:
+            page.goto(f"https://www.grasielyatacado.com.br/admin/products/{produto_id}/edit", wait_until="domcontentloaded")
+            # Tenta clicar na aba de variações para acionar o carregamento
+            try:
+                page.click('a[href="#variations"]', timeout=5000)
+            except Exception:
+                pass  # Se não houver aba, ignora
+        payload = response_info.value.json()
+        data = payload.get("data", [])
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
 # =========================
 # ✅ FUNÇÃO CORRIGIDA: PARSE DAS INFORMAÇÕES ADICIONAIS
 # =========================
@@ -269,6 +288,19 @@ def collect_product_data(page: Page, produto_id: str, attempt: int = 1) -> Optio
     # Parse dos dados
     try:
         d = detail_json
+        product.update(d)
+
+        variant_ids_raw = d.get("Variant", [])
+        variant_ids = []
+        if isinstance(variant_ids_raw, list):
+            variant_ids = [
+                str(item.get("id"))
+                for item in variant_ids_raw
+                if isinstance(item, dict) and item.get("id")
+            ]
+
+        variacoes_completas = fetch_variants_from_api(page, produto_id)
+        variacoes = variacoes_completas if variacoes_completas else [{"id": vid} for vid in variant_ids]
         
         # Extrai informações do SEO
         seo_title = None
@@ -293,6 +325,7 @@ def collect_product_data(page: Page, produto_id: str, attempt: int = 1) -> Optio
         additional_infos = parse_additional_infos(additional_infos_raw) if additional_infos_raw else []
         
         product.update({
+            "produto_id": str(d.get("id") or produto_id),
             "nome": d.get("name"),
             "preco": safe_float(d.get("price")),
             "descricao": clean_html(d.get("description", "")),
@@ -311,6 +344,7 @@ def collect_product_data(page: Page, produto_id: str, attempt: int = 1) -> Optio
             "tempo_garantia": d.get("warranty"),
             "ativo": d.get("active") == "1",
             "visivel": d.get("visible") == "1",
+            "variacoes": variacoes,
             "informacoes_adicionais": additional_infos,
             "seo_preview": {
                 "link": product_url,

@@ -16,7 +16,8 @@ from service.auth import authenticate, load_storage_state, _resolve_state_path
 from service.scraper import collect_all_products as collect_origem
 from service.scraperDestino import collect_all_products as collect_destino
 from service.storage import JSONStorage
-from service.sync import run_sync
+from service.sync_mod.run_sync import run_sync
+from service.fix_produto_47 import run_fix_produto
 from service.additional_info import (
     collect_all_additional_info,
     sync_additional_info_to_destino,
@@ -257,6 +258,20 @@ def action_sync_additional(browser: Browser) -> None:
         safe_close(ctx_destino, "DESTINO")
 
 
+def action_fix_produto_47(browser: Browser) -> None:
+    logger.info("Executando fix temporário do produto 47 no DESTINO...")
+    ctx, page = auth_in_context(
+        browser, DESTINO_URL, TARGET_USER, TARGET_PASS, COOKIES_DESTINO, "DESTINO"
+    )
+    if not page:
+        logger.error("Autenticação no DESTINO falhou")
+        return
+    try:
+        run_fix_produto(ctx, "47")
+    finally:
+        safe_close(ctx, "DESTINO")
+
+
 # ---------------------------------------------------------------------------
 # Menu principal
 # ---------------------------------------------------------------------------
@@ -268,19 +283,20 @@ MENU = """
   2  Colher dados DESTINO
   3  Sync ORIGEM → DESTINO (atualizar produtos)
   4  Sync Info Adicionais (origem → destino)
+    47 Fix temporário produto 47 (DESTINO)
   0  Sair
 ----------------------------------------------------------------------"""
 
 
 def main() -> None:
     print(MENU)
-    escolha = input("Escolha (1/2/3/4/0): ").strip()
+    escolha = input("Escolha (1/2/3/4/47/0): ").strip()
 
     if escolha == "0":
         print("Até mais!")
         return
 
-    if escolha not in {"1", "2", "3", "4"}:
+    if escolha not in {"1", "2", "3", "4", "47"}:
         print("Opção inválida.")
         return
 
@@ -296,6 +312,7 @@ def main() -> None:
                 "2": action_collect_destino,
                 "3": action_sync,
                 "4": action_sync_additional,
+                "47": action_fix_produto_47,
             }
             actions[escolha](browser)
         except KeyboardInterrupt:
