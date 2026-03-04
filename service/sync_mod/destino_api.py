@@ -384,6 +384,7 @@ def post_additional_infos(
                     return {
                         status: resp.status, ok: resp.ok,
                         redirected: resp.redirected,
+                        finalUrl: resp.url,
                         snippet: (await resp.text()).substring(0, 300),
                     };
                 } catch(e) { return {status: 0, error: e.message}; }
@@ -392,8 +393,22 @@ def post_additional_infos(
             [endpoint, body],
         )
 
-        ok = result.get("ok") or result.get("status") in (200, 302)
-        detail = f"status={result.get('status')}, redirected={result.get('redirected')}"
+        status = int(result.get("status") or 0)
+        redirected = bool(result.get("redirected"))
+        final_url = str(result.get("finalUrl") or "")
+        snippet = str(result.get("snippet") or "")
+        snippet_lower = snippet.lower()
+        final_url_lower = final_url.lower()
+
+        redirected_to_login = ("/admin/login" in final_url_lower) or ("/login" in final_url_lower and "/admin" in final_url_lower)
+        login_in_html = ("type=\"password\"" in snippet_lower) or ("name=\"password\"" in snippet_lower)
+
+        ok = (status in (200, 302) or bool(result.get("ok"))) and not redirected_to_login and not login_in_html
+        detail = f"status={status}, redirected={redirected}, final={final_url}"
+
+        if not ok and not snippet.strip():
+            detail += ", empty-response"
+
         return ok, detail
     except Exception as exc:
         return False, str(exc)

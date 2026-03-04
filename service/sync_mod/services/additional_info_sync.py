@@ -23,6 +23,7 @@ def sync_additional_infos(
     short_delay,
     medium_delay,
     create_missing_fields: bool = False,
+    source_context: str = "origem_infos",
 ):
     _log_section("SYNC INFORMAÇÕES ADICIONAIS")
 
@@ -43,6 +44,7 @@ def sync_additional_infos(
     sort_entries = []
     option_info_entries = []
     nao_encontrados = []
+    opcoes_nao_encontradas = {}
 
     for info in origem_infos:
         nome = domain.fix_opcao_banho_str((info.get("nome") or "").strip())
@@ -83,6 +85,8 @@ def sync_additional_infos(
                     destino_option_id = option_map.get(domain.normalize(opcao_nome))
                     if destino_option_id:
                         option_info_entries.append(f"{destino_option_id}-{destino_id}")
+                    else:
+                        opcoes_nao_encontradas.setdefault(nome, []).append(opcao_nome)
         else:
             nao_encontrados.append(nome)
             logger.warning("    ❌ '%s' NÃO existe no catálogo DESTINO", nome)
@@ -108,6 +112,8 @@ def sync_additional_infos(
         log_entry["infos_adicionais"] = {
             "status": "ja_correto",
             "ids": sorted(set_desejados),
+            "origem": source_context,
+            "opcoes_nao_encontradas": opcoes_nao_encontradas,
         }
         return
 
@@ -124,14 +130,32 @@ def sync_additional_infos(
     )
 
     if ok:
-        logger.info("✅ Infos adicionais atualizadas com sucesso (%s)", detail)
+        ids_pos = destino_api.get_product_current_infos(page, product_id, logger=logger)
+        set_pos = set(ids_pos)
+        consistente = set_pos == set_desejados
+
+        if consistente:
+            logger.info("✅ Infos adicionais atualizadas com sucesso (%s)", detail)
+            status_final = "atualizado"
+        else:
+            logger.warning(
+                "⚠️ Pós-validação divergente: esperado=%s atual=%s",
+                sorted(set_desejados),
+                sorted(set_pos),
+            )
+            status_final = "atualizado_com_divergencia"
+
         log_entry["infos_adicionais"] = {
-            "status": "atualizado",
+            "status": status_final,
             "ids_vinculados": ids_desejados,
             "adicionados": sorted(a_adicionar),
             "removidos": sorted(a_remover),
             "option_info_enviado": len(option_info_entries),
             "nao_encontrados_no_catalogo": nao_encontrados,
+            "opcoes_nao_encontradas": opcoes_nao_encontradas,
+            "ids_pos_update": sorted(set_pos),
+            "origem": source_context,
+            "detail": detail,
         }
     else:
         logger.error("❌ Falha ao atualizar infos adicionais: %s", detail)
@@ -139,4 +163,6 @@ def sync_additional_infos(
             "status": "falha",
             "detalhe": detail,
             "nao_encontrados_no_catalogo": nao_encontrados,
+            "opcoes_nao_encontradas": opcoes_nao_encontradas,
+            "origem": source_context,
         }

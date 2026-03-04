@@ -11,66 +11,6 @@ logger = logging.getLogger("sync")
 def _log_section(title: str):
     logger.info("")
     logger.info("─" * 60)
-
-
-def _build_infos_from_origem_variacoes(origem_variacoes: list) -> list:
-    grouped = {}
-
-    for variacao in origem_variacoes or []:
-        for sku_item in variacao.get("sku", []) or []:
-            info_nome = domain.fix_opcao_banho_str((sku_item.get("type") or "").strip())
-            option_nome = (sku_item.get("value") or "").strip()
-
-            if not info_nome or not option_nome:
-                continue
-
-            info_key = domain.normalize(info_nome)
-            if info_key not in grouped:
-                grouped[info_key] = {
-                    "nome": info_nome,
-                    "opcoes": {},
-                }
-
-            option_key = domain.normalize(option_nome)
-            grouped[info_key]["opcoes"][option_key] = {
-                "nome": option_nome,
-                "valor": "0.00",
-            }
-
-    infos = []
-    for item in grouped.values():
-        infos.append(
-            {
-                "nome": item["nome"],
-                "opcoes": list(item["opcoes"].values()),
-            }
-        )
-    return infos
-
-
-def _merge_infos(origem_infos: list, infos_from_variacoes: list) -> list:
-    merged = {}
-
-    for info in (origem_infos or []) + (infos_from_variacoes or []):
-        nome = domain.fix_opcao_banho_str((info.get("nome") or "").strip())
-        if not nome:
-            continue
-
-        key = domain.normalize(nome)
-        if key not in merged:
-            merged[key] = {"nome": nome, "opcoes": {}}
-
-        for op in info.get("opcoes") or []:
-            op_nome = (op.get("nome") or "").strip()
-            if not op_nome:
-                continue
-            op_key = domain.normalize(op_nome)
-            merged[key]["opcoes"][op_key] = {"nome": op_nome, "valor": op.get("valor", "0.00")}
-
-    result = []
-    for item in merged.values():
-        result.append({"nome": item["nome"], "opcoes": list(item["opcoes"].values())})
-    return result
     logger.info("  %s", title)
     logger.info("─" * 60)
 
@@ -84,6 +24,7 @@ def sync_variants(
     short_delay,
     medium_delay,
     use_post_for_variants: bool = False,
+    infos_already_synced: bool = False,
 ):
     _log_section("SYNC VARIAÇÕES")
 
@@ -105,24 +46,32 @@ def sync_variants(
 
             origem_variacoes = origem_product.get("variacoes", []) or []
             if origem_variacoes:
+                if infos_already_synced:
+                    logger.info("ℹ️ Infos derivadas de variações já sincronizadas anteriormente neste ciclo")
+                else:
+                    logger.info(
+                        "🔁 Contorno ativo: produto no modelo AdditionalInfos e ORIGEM com %d variações; convertendo SKU→AdditionalInfos.",
+                        len(origem_variacoes),
+                    )
+
+                    infos_merged = domain.build_infos_for_additional_model(origem_product)
+
+                    sync_additional_infos(
+                        page,
+                        product_id,
+                        infos_merged,
+                        token,
+                        log_entry,
+                        short_delay=short_delay,
+                        medium_delay=medium_delay,
+                        create_missing_fields=True,
+                        source_context="variacoes_fallback",
+                    )
+
+            if origem_variacoes:
                 logger.info(
-                    "🔁 Contorno ativo: produto no modelo AdditionalInfos e ORIGEM com %d variações; convertendo SKU→AdditionalInfos.",
+                    "📌 Modelo AdditionalInfos: variações da ORIGEM não serão enviadas via endpoint de variantes (%d variações).",
                     len(origem_variacoes),
-                )
-
-                infos_from_variacoes = _build_infos_from_origem_variacoes(origem_variacoes)
-                infos_origem = origem_product.get("informacoes_adicionais", []) or []
-                infos_merged = _merge_infos(infos_origem, infos_from_variacoes)
-
-                sync_additional_infos(
-                    page,
-                    product_id,
-                    infos_merged,
-                    token,
-                    log_entry,
-                    short_delay=short_delay,
-                    medium_delay=medium_delay,
-                    create_missing_fields=True,
                 )
 
             log_entry["variacoes"] = {
@@ -131,6 +80,7 @@ def sync_variants(
                 "properties_len": properties_len,
                 "additional_infos_len": additional_infos_len,
                 "fallback_infos_from_variacoes": bool(origem_product.get("variacoes", [])),
+                "infos_already_synced": infos_already_synced,
             }
             return
 

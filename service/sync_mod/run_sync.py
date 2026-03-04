@@ -178,28 +178,59 @@ def _preload_destino_cache(page: Any) -> bool:
 
 # ====================== LOAD ORIGEM ======================
 def _load_origem(context: Any, cookies_origem: list, origem_url: str, source_user: str, source_pass: str, storage_origem=None) -> List[dict]:
-    if storage_origem is not None and hasattr(storage_origem, "read_all"):
-        try:
-            produtos = storage_origem.read_all()
-            if isinstance(produtos, list) and produtos:
-                logger.info("📦 ORIGEM carregada do storage: %d produto(s)", len(produtos))
-                return produtos
-        except Exception as exc:
-            logger.warning("⚠️ Falha ao ler storage: %s", exc)
+    origem_source = str(getattr(config, "ORIGEM_SOURCE", "file") or "file").strip().lower()
 
-    fallback_path = os.path.join("produtos", "ProdutosOrigem.json")
-    if os.path.isfile(fallback_path):
-        try:
-            with open(fallback_path, "r", encoding="utf-8") as file:
-                data = json.load(file)
-            if isinstance(data, list):
-                logger.info("📄 ORIGEM carregada do JSON local: %d produto(s)", len(data))
-                return data
-        except Exception as exc:
-            logger.warning("⚠️ Falha JSON local: %s", exc)
+    def _read_storage() -> List[dict]:
+        if storage_origem is not None and hasattr(storage_origem, "read_all"):
+            try:
+                produtos = storage_origem.read_all()
+                if isinstance(produtos, list) and produtos:
+                    logger.info("📦 ORIGEM carregada do storage: %d produto(s)", len(produtos))
+                    return produtos
+            except Exception as exc:
+                logger.warning("⚠️ Falha ao ler storage: %s", exc)
+        return []
+
+    def _read_file() -> List[dict]:
+        fallback_path = os.path.join("produtos", "ProdutosOrigem.json")
+        if os.path.isfile(fallback_path):
+            try:
+                with open(fallback_path, "r", encoding="utf-8") as file:
+                    data = json.load(file)
+                if isinstance(data, list):
+                    logger.info("📄 ORIGEM carregada do JSON local: %d produto(s)", len(data))
+                    return data
+            except Exception as exc:
+                logger.warning("⚠️ Falha JSON local: %s", exc)
+        return []
+
+    if origem_source == "tray_api":
+        produtos = _read_storage()
+        if produtos:
+            return produtos
+        logger.warning("⚠️ ORIGEM_SOURCE=tray_api, mas sem dados no storage; usando fallback de arquivo")
+        produtos = _read_file()
+        if produtos:
+            return produtos
+    else:
+        produtos = _read_file()
+        if produtos:
+            return produtos
+        produtos = _read_storage()
+        if produtos:
+            return produtos
 
     logger.error("❌ ORIGEM não disponível")
     return []
+
+
+def _is_additional_infos_model(destino_json: dict) -> bool:
+    if not isinstance(destino_json, dict):
+        return False
+    has_variation = str(destino_json.get("has_variation", ""))
+    properties_len = len(destino_json.get("Properties") or [])
+    additional_infos_len = len(destino_json.get("AdditionalInfos") or [])
+    return has_variation != "1" and properties_len == 0 and additional_infos_len > 0
 
 
 def run_sync(
@@ -309,6 +340,7 @@ def run_sync(
             logger.error(f"❌ Falha ao buscar JSON do produto {pid} — pulando")
             log_entry["status"] = "erro_json_token"
             failed_count += 1
+            destino_page._append_live_result(destino_page.ENCONTRADOS_PATH, origem_prod.get("nome") or nome)
             _save_log(log_entry)
             continue
 
@@ -323,20 +355,40 @@ def run_sync(
                 log_entry["put_http_status"] = status
                 log_entry["put_erro"] = (body or "")[:300]
                 failed_count += 1
+                destino_page._append_live_result(destino_page.ENCONTRADOS_PATH, origem_prod.get("nome") or nome)
                 _save_log(log_entry)
                 continue
 
             log_entry["put_status"] = "sucesso"
             log_entry["put_http_status"] = status
 
+            infos_origem = origem_prod.get("informacoes_adicionais", []) or []
+            variacoes_origem = origem_prod.get("variacoes", []) or []
+            destino_is_infos_model = _is_additional_infos_model(destino_json)
+            infos_from_variacoes_mode = bool(destino_is_infos_model and variacoes_origem)
+
+            if infos_from_variacoes_mode:
+                infos_to_sync = domain.build_infos_for_additional_model(origem_prod)
+                logger.info(
+                    "🔁 Produto %s em modelo AdditionalInfos: convertendo %d variações da ORIGEM em infos adicionais",
+                    pid,
+                    len(variacoes_origem),
+                )
+                source_context = "origem_infos+variacoes"
+            else:
+                infos_to_sync = infos_origem
+                source_context = "origem_infos"
+
             sync_additional_infos(
                 page,
                 pid,
-                origem_prod.get("informacoes_adicionais", []),
+                infos_to_sync,
                 token,
                 log_entry,
                 short_delay=_short_delay,
                 medium_delay=_medium_delay,
+                create_missing_fields=infos_from_variacoes_mode,
+                source_context=source_context,
             )
 
             sync_variants(
@@ -347,8 +399,10 @@ def run_sync(
                 log_entry,
                 short_delay=_short_delay,
                 medium_delay=_medium_delay,
+                infos_already_synced=infos_from_variacoes_mode,
             )
 
+            destino_page.append_encontrado_sincronizado(origem_prod.get("nome") or nome)
             log_entry["status"] = "sucesso"
             _save_log(log_entry)
 
@@ -357,6 +411,7 @@ def run_sync(
             log_entry["status"] = "erro_execucao"
             log_entry["erro"] = str(exc)
             failed_count += 1
+            destino_page._append_live_result(destino_page.ENCONTRADOS_PATH, origem_prod.get("nome") or nome)
             _save_log(log_entry)
             continue
 

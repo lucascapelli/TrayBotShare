@@ -8,8 +8,9 @@ from patchright.sync_api import Page
 
 from .config import DESTINO_BASE
 
-ENCONTRADOS_PATH = os.path.join("produtos", "Encontrados.txt")
+ENCONTRADOS_PATH = os.path.join("produtos", "EncontradoseNãosincronizados.txt")
 NAO_ENCONTRADOS_PATH = os.path.join("produtos", "NaoEncontrados.txt")
+ENCONTRADOS_SINCRONIZADOS_PATH = os.path.join("produtos", "EncontradoseSincronizados.txt")
 
 
 def _append_live_result(file_path: str, nome: str) -> None:
@@ -20,6 +21,10 @@ def _append_live_result(file_path: str, nome: str) -> None:
             f.flush()
     except Exception:
         pass
+
+
+def append_encontrado_sincronizado(nome: str) -> None:
+    _append_live_result(ENCONTRADOS_SINCRONIZADOS_PATH, nome)
 
 
 def normalize_name(name: str) -> str:
@@ -109,13 +114,11 @@ def match_products_inteligente(
         if ref and f"ref:{ref}" in destino_cache:
             data = destino_cache[f"ref:{ref}"]
             matches.append({"destino_id": data["id"], "destino_name": data["name"], "origem_product": produto})
-            _append_live_result(ENCONTRADOS_PATH, nome)
             origem_by_key.pop(key, None)
             continue
         if ref and f"sku:{ref}" in destino_cache:
             data = destino_cache[f"sku:{ref}"]
             matches.append({"destino_id": data["id"], "destino_name": data["name"], "origem_product": produto})
-            _append_live_result(ENCONTRADOS_PATH, nome)
             origem_by_key.pop(key, None)
             continue
         name_key = f"name:{norm}"
@@ -125,7 +128,6 @@ def match_products_inteligente(
             data = _pick_best_name_candidate(nome, candidates)
             if data:
                 matches.append({"destino_id": data["id"], "destino_name": data["name"], "origem_product": produto})
-                _append_live_result(ENCONTRADOS_PATH, nome)
                 origem_by_key.pop(key, None)
                 continue
 
@@ -169,7 +171,6 @@ def _browser_search_batch(page: Page, pending: List[dict], logger, short_delay) 
                             "destino_name": item_name,
                             "origem_product": produto
                         })
-                        _append_live_result(ENCONTRADOS_PATH, nome)
                         logger.info(f"✅ BROWSER MATCH: {nome[:60]}")
                         break
                 else:
