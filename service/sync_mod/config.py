@@ -12,6 +12,7 @@ ORIGEM_JSON_PATH = "produtos/ProdutosOrigem.json"
 ORIGEM_TRAY_BASE = "https://www.grasiely.com.br"
 ORIGEM_TRAY_PRODUCT_ENDPOINT = "/admin/api/products/{product_id}"
 ORIGEM_TRAY_ACCEPT = "application/json"
+ORIGEM_TRAY_MAX_PAGES = 0  # 0 = sem limite; >0 limita quantidade de páginas coletadas
 
 # Campos esperados no JSON bruto de produto retornado pela Tray (em data)
 ORIGEM_TRAY_REQUIRED_KEYS = (
@@ -41,6 +42,6 @@ ORIGEM_TRAY_TO_SYNC_MAP = {
 	"length": "comprimento",
 }
 
-MODO_TESTE_APENAS_COM_INFOS = True
+MODO_TESTE_APENAS_COM_INFOS = False
 LOG_FILE = "produtos/sync_log.json"
 SKIP_DESTINO_PRODUCT_IDS = {"47"}

@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import time
+import asyncio
 from contextlib import contextmanager
 from typing import Optional
 
@@ -32,6 +33,39 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("main")
+
+
+def _install_asyncio_exception_filter() -> None:
+    """
+    Evita spam de erro no shutdown quando tarefas internas do Patchright
+    ainda tentam finalizar requests após contexto/browser fechar.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        return
+
+    previous_handler = loop.get_exception_handler()
+
+    def _handler(current_loop, context):
+        exc = context.get("exception")
+        msg = str(context.get("message") or "")
+        exc_text = str(exc or "")
+        lowered = f"{msg} {exc_text}".lower()
+
+        is_target_closed = "target page, context or browser has been closed" in lowered
+        is_unretrieved_task = "task exception was never retrieved" in lowered
+
+        if is_target_closed and is_unretrieved_task:
+            logger.debug("Ignorando TargetClosedError de shutdown do Patchright")
+            return
+
+        if previous_handler:
+            previous_handler(current_loop, context)
+        else:
+            current_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_handler)
 
 # ---------------------------------------------------------------------------
 # Variáveis de ambiente
@@ -150,6 +184,16 @@ def safe_close(context: Optional[BrowserContext], label: str) -> None:
     if context is None:
         return
     try:
+        try:
+            for page in context.pages:
+                try:
+                    page.wait_for_timeout(300)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        time.sleep(0.2)
         context.close()
         logger.info("[%s] Contexto encerrado com sucesso", label)
     except Exception as exc:
@@ -289,6 +333,8 @@ MENU = """
 
 
 def main() -> None:
+    _install_asyncio_exception_filter()
+
     print(MENU)
     escolha = input("Escolha (1/2/3/4/47/0): ").strip()
 
@@ -320,8 +366,12 @@ def main() -> None:
         except Exception as exc:
             logger.exception("Erro não tratado: %s", exc)
         finally:
-            browser.close()
-            logger.info("Browser encerrado")
+            try:
+                time.sleep(0.2)
+                browser.close()
+                logger.info("Browser encerrado")
+            except Exception as exc:
+                logger.warning("Erro ao encerrar browser: %s", exc)
 
 
 if __name__ == "__main__":
