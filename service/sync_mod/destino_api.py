@@ -19,7 +19,10 @@
 #   - logs adicionais para esclarecer counts e método de autenticação
 #
 # Todos os demais métodos mantidos ou levemente adaptados para compatibilidade.
-
+#
+# Obs: substitua por inteiro este arquivo no seu projeto para garantir que o
+# post_additional_infos novo e os patches estejam presentes.
+#
 import json
 import logging
 import random
@@ -165,7 +168,7 @@ def collect_property_value_ids_from_variants(variants: List[dict]) -> List[str]:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [PATCH-A] fetch_origin_variants_full — NOVO (aceita token fallback)
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 
 def fetch_origin_variants_full(
     page: Page,
@@ -452,7 +455,7 @@ def fetch_origin_auth_token(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Product CRUD (sem alterações)
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 
 def get_product_details(
     page: Page, product_id: str, token: str, logger
@@ -796,6 +799,7 @@ def _post_form_urlencoded(
     if referer:
         headers["Referer"] = referer
 
+    # usar encoding padrão (str) aqui — chamadas que exigem UTF-8 usam urlencode(..., encoding='utf-8')
     body = urlencode(
         {k: "" if v is None else str(v) for k, v in form_data.items()}
     )
@@ -812,18 +816,33 @@ def _post_form_urlencoded(
 
 
 def _create_additional_info_field(
-    page: Page, info_name: str, logger
+    page: Page, info_name: str, logger, field_type: str = "S"
 ) -> bool:
+    """
+    Cria um campo Additional Info no DESTINO.
+    field_type:
+      - "S" = select/options
+      - "T" = textarea (texto)
+      - "I" = input (campo textual single-line)
+
+    Ajusta 'obrigatorio' e 'add_total' conforme tipo:
+      - Para text/input (T/I) => obrigatorio = 0, add_total = 0
+      - Para select (S) => obrigatorio = 1, add_total = 1
+    """
+    # Definir flags de acordo com tipo
+    obrigatorio_flag = "0" if field_type in ("T", "I") else "1"
+    add_total_flag = "0" if field_type in ("T", "I") else "1"
+
     form_data = {
         "nome_loja": info_name,
         "nome_adm":  info_name,
         "ativa":     "1",
         "exibir_valor": "0",
-        "obrigatorio":  "1",
+        "obrigatorio":  obrigatorio_flag,
         "contador":     "0",
-        "tipo":         "S",
+        "tipo":         field_type,
         "valor":        "0.00",
-        "add_total":    "1",
+        "add_total":    add_total_flag,
         "ordem":        "0",
     }
 
@@ -839,8 +858,8 @@ def _create_additional_info_field(
         )
         if status in (200, 201, 302):
             logger.info(
-                "🆕 Campo Additional Info criado via %s (status %s): %s",
-                endpoint, status, info_name,
+                "🆕 Campo Additional Info criado via %s (status %s): %s (tipo=%s)",
+                endpoint, status, info_name, field_type,
             )
             return True
         logger.warning(
@@ -886,558 +905,142 @@ def ensure_additional_info_with_options(
     info_name: str,
     option_names: List[str],
     logger,
+    field_type: str = "S",
 ) -> Optional[dict]:
-    catalog        = fetch_all_additional_infos_catalog(page, token, logger=logger)
-    normalized_name = normalize(info_name)
-    info           = catalog.get(normalized_name)
-
-    if not info:
-        if not _create_additional_info_field(page, info_name, logger=logger):
-            return None
-        time.sleep(random.uniform(0.4, 0.9))
+    """
+    Garante que exista um campo AdditionalInfo com as opções desejadas no DESTINO.
+    field_type: "S"=select, "T"=textarea/text, "I"=input
+    Retorna o dict { "id": "...", "name": "...", "option_map": {...} } do catálogo final,
+    ou None se falhar.
+    """
+    try:
         catalog = fetch_all_additional_infos_catalog(page, token, logger=logger)
-        info    = catalog.get(normalized_name)
-        if not info:
-            logger.warning(
-                "Campo '%s' foi criado, mas não apareceu no catálogo após refresh",
-                info_name,
-            )
+        normalized_name = normalize(info_name)
+        info = catalog.get(normalized_name)
+
+        if info:
+            # verificar opções faltantes e criar se necessário (pular se textual)
+            missing = []
+            for opt in option_names:
+                if normalize(opt) not in info.get("option_map", {}):
+                    missing.append(opt)
+            if missing and field_type != "T":
+                logger.info("Opções faltando para '%s': %s", info_name, missing)
+                for opt in missing:
+                    created = _create_additional_info_option(page, info["id"], opt, logger)
+                    if created:
+                        # atualizar o catálogo localmente
+                        info["option_map"][normalize(opt)] = "unknown"
+                # Não garantimos IDs das opções criadas aqui; usuário pode reconsultar catálogo
+            return info
+
+        # se não existe, criar campo + opções (respeitando field_type)
+        created_field = _create_additional_info_field(page, info_name, logger, field_type=field_type)
+        if not created_field:
+            logger.warning("Não foi possível criar campo additional info '%s' (tipo=%s)", info_name, field_type)
             return None
 
-    info_id    = str(info.get("id"))
-    option_map = info.get("option_map") if isinstance(info.get("option_map"), dict) else {}
+        # após criar, recarregar catálogo e tentar mapear opções
+        catalog = fetch_all_additional_infos_catalog(page, token, logger=logger)
+        info = catalog.get(normalized_name)
+        if not info:
+            logger.warning("Campo criado mas não encontrado no catálogo após criação: %s", info_name)
+            return None
 
-    for option_name in option_names:
-        opt_name = (option_name or "").strip()
-        if not opt_name:
-            continue
-        if normalize(opt_name) in option_map:
-            continue
-        _create_additional_info_option(page, info_id, opt_name, logger=logger)
+        # criar opções ausentes explicitamente (pular criação de opções quando textual)
+        if field_type != "T":
+            for opt in option_names:
+                if normalize(opt) not in info.get("option_map", {}):
+                    _create_additional_info_option(page, info["id"], opt, logger)
 
-    time.sleep(random.uniform(0.3, 0.8))
-    refreshed = fetch_all_additional_infos_catalog(
-        page, token, logger=logger
-    ).get(normalized_name)
-    return refreshed if isinstance(refreshed, dict) else info
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LEITURA DE OPÇÕES MARCADAS DA ORIGEM VIA HTTP (melhorada: múltiplas URLs + token)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def read_origin_checked_options(
-    page: Page,
-    origin_base: str,
-    product_id: str,
-    cookies_origem,
-    logger,
-) -> Dict[str, List[str]]:
-    """
-    Lê a página de additional_product_info da ORIGEM via HTTP GET
-    e retorna quais opções estão REALMENTE marcadas (checked).
-
-    Melhorias:
-      - Tenta múltiplas URLs conhecidas antes de fallback
-      - Aceita autenticação por Cookie OU Authorization Bearer token (capturado via fetch_origin_auth_token)
-    """
-    urls_to_try = [
-        f"{origin_base}/mvc/adm/additional_product_info/additional_product_info/edit/{product_id}",
-        f"{origin_base}/admin/products/{product_id}/edit",
-        f"{origin_base}/admin/products/product/{product_id}",
-    ]
-
-    cookie_str = _build_cookie_header(cookies_origem)
-    token = ""
-    headers_base = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/145.0.0.0 Safari/537.36"
-        ),
-        "Referer": f"{origin_base}/admin/products/{product_id}/edit",
-    }
-
-    # Try sequence: cookie (if present) -> multiple urls -> if fail, try to capture token and retry
-    def try_urls_with_headers(headers) -> Optional[str]:
-        for url in urls_to_try:
-            try:
-                resp = page.request.get(url, headers=headers, timeout=15000)
-                if resp.status != 200:
-                    logger.debug("GET %s returned status %s", url, resp.status)
-                    continue
-                raw = resp.body()
-                # decode
-                try:
-                    html = raw.decode("utf-8")
-                except UnicodeDecodeError:
-                    html = raw.decode("latin-1", errors="ignore")
-                # quick sanity
-                if len(html) < 200:
-                    logger.debug("HTML curto (%d) em %s", len(html), url)
-                    continue
-                html_lower = html.lower()
-                if 'type="password"' in html_lower or "name='password'" in html_lower:
-                    logger.debug("Redirect to login detected in %s", url)
-                    continue
-                return html
-            except Exception as exc:
-                logger.debug("Erro GET %s: %s", url, exc)
-                continue
+        # recarregar final
+        catalog = fetch_all_additional_infos_catalog(page, token, logger=logger)
+        return catalog.get(normalized_name)
+    except Exception as exc:
+        logger.warning("Erro ensure_additional_info_with_options para %s: %s", info_name, exc)
         return None
 
-    # 1) Try with cookie if available
-    if cookie_str:
-        headers = dict(headers_base)
-        headers["Cookie"] = cookie_str
-        html = try_urls_with_headers(headers)
-        if html:
-            logger.info("🔐 read_origin_checked_options: usando Cookie para autenticação")
-            return _parse_origin_html_options(html, logger)
 
-    # 2) Try extracting token from page (if cookie absent or failed)
-    try:
-        token = fetch_origin_auth_token(page, origin_base, product_id, cookies_origem, logger)
-    except Exception as exc:
-        logger.debug("Erro capturando token via fetch_origin_auth_token: %s", exc)
-        token = ""
-
-    if token:
-        headers = dict(headers_base)
-        headers["Authorization"] = token
-        html = try_urls_with_headers(headers)
-        if html:
-            logger.info("🔐 read_origin_checked_options: usando Authorization token para autenticação")
-            return _parse_origin_html_options(html, logger)
-
-    # 3) As última tentativa: usar Playwright rendering (sem adicionar cookies) para tentar coletar via interação
-    logger.warning("⚠️ read_origin_checked_options: falha em GET HTML via cookie/token; tentativa com Playwright navegacional")
-    try:
-        return read_origin_checked_options_playwright(page, origin_base, product_id, cookies_origem, logger)
-    except Exception as exc:
-        logger.warning("Erro fallback Playwright na leitura de opções ORIGEM: %s", exc)
-        return {}
-
-
-def read_origin_checked_options_playwright(
-    page: Page,
-    origin_base: str,
-    product_id: str,
-    cookies_origem,
-    logger,
-) -> Dict[str, List[str]]:
-    """
-    (mantida) Coleta opções marcadas/visíveis na página de edição do produto NA ORIGEM
-    usando interação Playwright (navegação + cliques). Retorna mapa
-    normalized_field_name -> [label1, label2, ...]
-    """
-    result = {}
-    try:
-        # Tentar adicionar cookies ao contexto para manter sessão
-        try:
-            context = getattr(page, "context", None)
-            if context and cookies_origem:
-                cookies_to_add = []
-                # aceitar formatos: list of dicts ou list of strings
-                for c in cookies_origem:
-                    if isinstance(c, dict):
-                        name = c.get("name") or c.get("Name")
-                        value = c.get("value") or c.get("Value")
-                        if name and value:
-                            cookies_to_add.append({"name": name, "value": value, "url": origin_base})
-                    elif isinstance(c, str) and "=" in c:
-                        parts = c.split("=", 1)
-                        cookies_to_add.append({"name": parts[0].strip(), "value": parts[1].strip(), "url": origin_base})
-                if cookies_to_add:
-                    try:
-                        context.add_cookies(cookies_to_add)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        url = f"{origin_base}/admin/products/{product_id}/edit"
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=20000)
-        except Exception:
-            try:
-                page.goto(url, wait_until="networkidle", timeout=30000)
-            except Exception as e:
-                logger.warning("⚠️ Navegação ORIGEM falhou: %s", e)
-                return {}
-
-        # localizar o container de variações
-        try:
-            container = page.locator("#product-variations-form")
-            if container.count() == 0:
-                container = None
-        except Exception:
-            container = None
-
-        # coletar possíveis labels/fields
-        field_texts = []
-        try:
-            if container is not None:
-                try:
-                    field_texts = container.locator("label, h3, h4, .variation-label, .field-label, legend, .title, .form-group").all_text_contents()
-                except Exception:
-                    field_texts = []
-            else:
-                try:
-                    field_texts = page.locator("label, h3, h4, .variation-label, .field-label, legend, .title, .form-group").all_text_contents()
-                except Exception:
-                    field_texts = []
-        except Exception:
-            field_texts = []
-
-        # Normalizar e deduplicar
-        seen_fields = []
-        for t in field_texts:
-            s = (t or "").strip()
-            if not s:
-                continue
-            n = normalize(s)
-            if n not in seen_fields:
-                seen_fields.append(n)
-
-        logger.info("🔎 ORIGEM fields detectados (amostra): %s", seen_fields[:30])
-
-        # Para cada field detectado, tentar clicar e coletar opções visíveis
-        for raw in list(dict.fromkeys(field_texts)):
-            title = (raw or "").strip()
-            if not title:
-                continue
-            norm_title = normalize(title)
-            options = []
-            try:
-                # tentar clicar no campo
-                try:
-                    locator = None
-                    if container is not None:
-                        locator = container.get_by_text(title)
-                        if locator.count() == 0:
-                            locator = page.get_by_text(title)
-                    else:
-                        locator = page.get_by_text(title)
-                    if locator and locator.count() > 0:
-                        try:
-                            locator.first.click()
-                        except Exception:
-                            try:
-                                locator.first.scroll_into_view_if_needed()
-                                locator.first.click()
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-                # breve espera
-                try:
-                    page.wait_for_timeout(300)
-                except Exception:
-                    pass
-
-                # coletar opções no container
-                opts_nodes = None
-                try:
-                    if container is not None:
-                        opts_nodes = container.locator("[role='option'], .dropdown-menu li, li, button, a, span, .option, .variation-option")
-                    else:
-                        opts_nodes = page.locator("[role='option'], .dropdown-menu li, li, button, a, span, .option, .variation-option")
-                except Exception:
-                    opts_nodes = None
-
-                texts = []
-                try:
-                    if opts_nodes is not None:
-                        texts = opts_nodes.all_text_contents()
-                except Exception:
-                    texts = []
-
-                for tt in texts:
-                    v = (tt or "").strip()
-                    if not v:
-                        continue
-                    if normalize(v) == norm_title:
-                        continue
-                    if v not in options:
-                        options.append(v)
-
-                # fallback: coletar textos curtos do container
-                if not options and container is not None:
-                    try:
-                        all_texts = container.all_text_contents()
-                        for at in all_texts:
-                            s = (at or "").strip()
-                            if not s or len(s) > 30:
-                                continue
-                            if normalize(s) == norm_title:
-                                continue
-                            if s not in options:
-                                options.append(s)
-                    except Exception:
-                        pass
-
-            except Exception as exc:
-                logger.debug("Erro ao coletar opções para field '%s': %s", title, exc)
-
-            if options:
-                result[norm_title] = options
-
-        logger.info("🔎 ORIGEM options coletadas: %d campos", len(result))
-        return result
-    except Exception as exc:
-        logger.warning("Erro geral coleta ORIGEM via Playwright: %s", exc)
-        return {}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# [PATCH-C] _parse_origin_html_options — MELHORADO
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _parse_origin_html_options(
-    html: str, logger
-) -> Dict[str, List[str]]:
-    """
-    [PATCH-C] Parseia HTML da página additional_product_info da ORIGEM.
-    (mantido/sem mudanças relevantes além de logs)
-    """
-    field_id_to_name: Dict[str, str] = {}
-
-    # ── Padrão 1: <div|section id="field_NNN|info_NNN"> → <label|h*|strong>Nome</tag>
-    for m in re.finditer(
-        r'id=["\'](?:field_|info_|item_)?(\d{2,6})["\'][^>]*>'
-        r'(?:(?!<(?:div|section|form)\b).){0,400}'
-        r'<(?:label|h[2-6]|strong|span)[^>]*>\s*([^<]{2,80})\s*</(?:label|h[2-6]|strong|span)>',
-        html,
-        re.IGNORECASE | re.DOTALL,
-    ):
-        fid   = m.group(1)
-        fname = m.group(2).strip().rstrip(':').strip()
-        if fname and fid not in field_id_to_name:
-            field_id_to_name[fid] = fname
-
-    # ── Padrão 2: texto "NNN-NomeCampo" — Nome começa com maiúscula/acento
-    for m in re.finditer(
-        r'\b(\d{2,6})\s*[-–]\s*([A-ZÁÉÍÓÚÀÂÊÎÔÛÃÕÇ][a-zA-ZáéíóúàâêîôûãõçA-Z0-9 ]{2,60})',
-        html,
-    ):
-        fid   = m.group(1)
-        fname = m.group(2).strip().rstrip(':').strip()
-        if fname and fid not in field_id_to_name:
-            field_id_to_name[fid] = fname
-
-    # ── Padrão 3 (fallback original): qualquer "NNN - texto de 2-60 chars"
-    for m in re.finditer(r'(\d{2,6})\s*[-–]\s*([^<"\n\r]{2,60})', html):
-        fid   = m.group(1)
-        fname = m.group(2).strip().rstrip(':').strip()
-        if fname and fid not in field_id_to_name:
-            field_id_to_name[fid] = fname
-
-    # ── Passo 2: Encontrar todos os checkboxes option_info ──
-    checked_by_field:   Dict[str, List[str]] = {}
-    unchecked_by_field: Dict[str, int]       = {}
-
-    for match in re.finditer(
-        r'<input\b([^>]*)>([^<]{0,120})',
-        html,
-        re.IGNORECASE | re.DOTALL,
-    ):
-        attrs      = match.group(1)
-        label_text = match.group(2).strip()
-
-        # Só checkboxes de option_info
-        if not re.search(r'type\s*=\s*["\']checkbox["\']', attrs, re.IGNORECASE):
-            continue
-        if "option_info" not in attrs:
-            continue
-
-        # Extrair value (formato: OPTION_ID-FIELD_ID)
-        value_match = re.search(
-            r'value\s*=\s*["\']([^"\']+)["\']', attrs, re.IGNORECASE
-        )
-        if not value_match:
-            continue
-
-        value  = value_match.group(1)
-        parts  = value.split("-")
-        if len(parts) < 2:
-            continue
-
-        field_id   = parts[-1]   # último segmento = field ID
-        is_checked = bool(re.search(r'\bchecked\b', attrs, re.IGNORECASE))
-
-        # Label: texto após o input, ou fallback para option_id
-        label = label_text.strip() if label_text.strip() else parts[0]
-
-        if is_checked:
-            if field_id not in checked_by_field:
-                checked_by_field[field_id] = []
-            checked_by_field[field_id].append(label)
-        else:
-            unchecked_by_field[field_id] = unchecked_by_field.get(field_id, 0) + 1
-
-    # ── Passo 3: Converter field_id → normalized_name ──
-    result: Dict[str, List[str]] = {}
-    for fid, labels in checked_by_field.items():
-        fname = field_id_to_name.get(fid, fid)
-        norm  = normalize(fname)
-        result[norm] = labels
-
-    if result:
-        total_checked   = sum(len(v) for v in result.values())
-        total_unchecked = sum(unchecked_by_field.values())
-        logger.info(
-            "📖 [PATCH-C] ORIGEM HTML: %d campos | %d checked | %d unchecked",
-            len(result), total_checked, total_unchecked,
-        )
-        for norm_name, opts in result.items():
-            fname = next(
-                (fn for fid, fn in field_id_to_name.items()
-                 if normalize(fn) == norm_name),
-                norm_name,
-            )
-            fid_for_unchecked = next(
-                (fid for fid, fn in field_id_to_name.items()
-                 if normalize(fn) == norm_name),
-                "",
-            )
-            unchecked = unchecked_by_field.get(fid_for_unchecked, 0)
-            logger.info(
-                "    '%s': %d checked, %d unchecked → %s",
-                fname, len(opts), unchecked, opts[:10],
-            )
-    else:
-        logger.warning(
-            "⚠️ [PATCH-C] Nenhuma opção checked encontrada no HTML da ORIGEM"
-        )
-        total_cb = len(re.findall(r"option_info", html))
-        logger.info(
-            "    (encontrados %d refs a option_info no HTML)", total_cb
-        )
-
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Leitura de infos vinculadas do DESTINO (sem alterações)
-# ══════════════════════════════════════════════════════════════════════════════
+# ====================== UTILITÁRIOS DE LEITURA DO PRODUTO ATUAL ======================
 
 def get_product_current_infos(
-    page: Page, product_id: str, logger
+    page: Page,
+    product_id: str,
+    logger
 ) -> List[str]:
-    url = (
-        f"{DESTINO_BASE}/mvc/adm/additional_product_info/"
-        f"additional_product_info/edit/{product_id}"
-    )
+    """
+    Tenta recuperar os Additional Info IDs atualmente vinculados ao produto no DESTINO.
+    Estratégia:
+      1) Tenta chamada API GET /admin/api/products/{product_id} sem token (usa sessão do page)
+      2) Se falhar, carrega a página de edição e tenta extrair inputs selected_items via DOM
+    Retorna lista de ids (strings).
+    """
+    results: List[str] = []
     try:
-        resp = page.request.get(
-            url,
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "X-Requested-With": "XMLHttpRequest",
-            },
-        )
-        if resp.status != 200:
-            logger.warning(
-                "GET infos do produto %s: status %d", product_id, resp.status
-            )
-            return []
-
-        raw_html = resp.body()
+        url = f"{DESTINO_BASE}/admin/api/products/{product_id}"
         try:
-            html = raw_html.decode("utf-8")
-        except UnicodeDecodeError:
-            html = raw_html.decode("latin-1", errors="ignore")
+            resp = page.request.get(url, headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"}, timeout=15000)
+            if resp.status == 200:
+                data = resp.json()
+                p = data.get("data") or data
+                # possíveis lugares onde os AdditionalInfos aparecem
+                candidates = [
+                    p.get("AdditionalInfos"),
+                    p.get("additional_infos"),
+                    p.get("AdditionalProductInfo"),
+                    (p.get("data") or {}).get("AdditionalInfos") if isinstance(p.get("data"), dict) else None,
+                ]
+                for cand in candidates:
+                    if isinstance(cand, list):
+                        for it in cand:
+                            if isinstance(it, dict) and it.get("id"):
+                                results.append(str(it.get("id")))
+                            elif isinstance(it, (str, int)):
+                                results.append(str(it))
+                if results:
+                    return results
+        except Exception as e:
+            logger.debug("get_product_current_infos: API GET falhou: %s", e)
 
-        current_ids = set()
+        # fallback: tentar extrair via DOM na página de edição
+        try:
+            edit_url = f"{DESTINO_BASE}/mvc/adm/additional_product_info/additional_product_info/edit/{product_id}"
+            page.goto(edit_url, wait_until="domcontentloaded", timeout=15000)
+        except Exception:
+            try:
+                page.goto(f"{DESTINO_BASE}/admin/products/{product_id}/edit", wait_until="domcontentloaded", timeout=15000)
+            except Exception:
+                pass
 
-        # selected_items[] (qualquer ordem de atributos)
-        for m in re.finditer(
-            r'<input[^>]*name\s*=\s*["\']selected_items\[\]["\'][^>]*value\s*=\s*["\'](\d+)["\']',
-            html, re.DOTALL | re.IGNORECASE,
-        ):
-            current_ids.add(m.group(1))
-        for m in re.finditer(
-            r'<input[^>]*value\s*=\s*["\'](\d+)["\'][^>]*name\s*=\s*["\']selected_items\[\]["\']',
-            html, re.DOTALL | re.IGNORECASE,
-        ):
-            current_ids.add(m.group(1))
-
-        # checked + value + selected
-        for m in re.finditer(
-            r'<input[^>]*\bchecked\b[^>]*value\s*=\s*["\'](\d+)["\'][^>]*name\s*=\s*["\']selected[^"\']*["\']',
-            html, re.DOTALL | re.IGNORECASE,
-        ):
-            current_ids.add(m.group(1))
-        for m in re.finditer(
-            r'<input[^>]*value\s*=\s*["\'](\d+)["\'][^>]*\bchecked\b[^>]*name\s*=\s*["\']selected[^"\']*["\']',
-            html, re.DOTALL | re.IGNORECASE,
-        ):
-            current_ids.add(m.group(1))
-
-        # sort[] 
-        for m in re.finditer(
-            r'name\s*=\s*["\']sort\[\]["\'][^>]*value\s*=\s*["\'](\d+)',
-            html, re.DOTALL | re.IGNORECASE,
-        ):
-            current_ids.add(m.group(1))
-        for m in re.finditer(
-            r'value\s*=\s*["\'](\d+)["\'][^>]*name\s*=\s*["\']sort\[\]["\']',
-            html, re.DOTALL | re.IGNORECASE,
-        ):
-            current_ids.add(m.group(1))
-
-        result = sorted(current_ids)
-        logger.info(
-            "📎 Produto %s: %d infos vinculadas: %s",
-            product_id, len(result), result,
-        )
-        return result
+        # avaliar inputs selected_items ou campos hidden que indiquem selecionados
+        try:
+            vals = page.evaluate(
+                """() => {
+                    const out = [];
+                    // inputs com name starting selected_items
+                    document.querySelectorAll('input[name^="selected_items"]').forEach(n => {
+                        if (n.value) out.push(n.value);
+                    });
+                    // selects / checkboxes com classe ou data attribute comum
+                    document.querySelectorAll('select, input[type="checkbox"]').forEach(n => {
+                        const name = n.getAttribute && n.getAttribute('name');
+                        if (name && name.startsWith('selected_items') && n.value) out.push(n.value);
+                    });
+                    return out;
+                }"""
+            )
+            if isinstance(vals, list) and vals:
+                return [str(v) for v in vals if v]
+        except Exception as e:
+            logger.debug("get_product_current_infos: DOM extraction failed: %s", e)
 
     except Exception as exc:
-        logger.warning(
-            "Erro ao buscar infos atuais do produto %s: %s", product_id, exc
-        )
-        return []
+        logger.warning("Erro get_product_current_infos: %s", exc)
+
+    return [str(x) for x in results]
 
 
-def get_product_current_checked_options(
-    page: Page, product_id: str, logger
-) -> Dict[str, List[str]]:
-    """
-    Lê quais opções estão checked no DESTINO para comparação.
-    Usa a mesma lógica de parse que a ORIGEM.
-    """
-    url = (
-        f"{DESTINO_BASE}/mvc/adm/additional_product_info/"
-        f"additional_product_info/edit/{product_id}"
-    )
-    try:
-        resp = page.request.get(
-            url,
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
-        )
-        if resp.status != 200:
-            return {}
-
-        raw = resp.body()
-        try:
-            html = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            html = raw.decode("latin-1", errors="ignore")
-
-        return _parse_origin_html_options(html, logger)
-    except Exception:
-        return {}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# POST de infos adicionais — CORRIGIDO (sem novas alterações nesta versão)
-# ══════════════════════════════════════════════════════════════════════════════
+# ====================== POST / EDIT: post_additional_infos (VERSÃO ROBUSTA) ======================
 
 def post_additional_infos(
     page: Page,
@@ -1447,299 +1050,255 @@ def post_additional_infos(
     sort_entries: Optional[List[str]] = None,
     option_info_entries: Optional[List[str]] = None,
 ) -> Tuple[bool, str]:
-    nav_url = (
-        f"{DESTINO_BASE}/admin/#/mvc/adm/additional_product_info/"
-        f"additional_product_info/edit/{product_id}"
-    )
-    try:
-        page.goto(nav_url, wait_until="networkidle", timeout=15000)
-        short_delay()
-    except Exception as e:
-        _logger.warning(
-            "⚠️ Nav p/ infos produto %s falhou: %s — tentando POST",
-            product_id, str(e)[:80],
-        )
-
-    # Apenas UM _method=POST (fix anterior mantido)
-    parts = ["_method=POST"]
-
-    for info_id in info_ids_to_link:
-        parts.append(f"selected_items%5B%5D={info_id}")
-    parts.append(f"id_produto={product_id}")
-    parts.append("data%5BAdditionalProductInfo%5D%5Bherda_prazo%5D=0")
-    parts.append("data%5BAdditionalProductInfo%5D%5Bprazo%5D=0")
-
-    if sort_entries:
-        for entry in sort_entries:
-            parts.append(f"sort%5B%5D={entry}")
-    else:
-        for info_id in info_ids_to_link:
-            parts.append(f"sort%5B%5D={info_id}-")
-
-    # option_info[] controla quais opções individuais ficam checked
-    if option_info_entries:
-        for entry in option_info_entries:
-            parts.append(f"option_info%5B%5D={entry}")
-
-    body     = "&".join(parts)
-    endpoint = (
+    """
+    Envia POST para vincular Additional Infos no DESTINO (Tray).
+    - Extrai CSRF token da página de edição
+    - Monta payload idêntico ao form real
+    - Usa evaluate/fetch para simular envio do navegador
+    - Valida pós-envio com reload e reconsulta
+    """
+    edit_url = (
         f"{DESTINO_BASE}/mvc/adm/additional_product_info/"
         f"additional_product_info/edit/{product_id}"
     )
 
+    _logger.info("Acessando página de edição para extrair CSRF e contexto: %s", edit_url)
+
     try:
+        # 1. Carrega a página de edição (necessário para CSRF e sessão)
+        response = page.goto(edit_url, wait_until="networkidle", timeout=45000)
+        short_delay()  # espera JS carregar
+
+        if not response or (hasattr(response, "status") and response.status != 200):
+            _logger.error(
+                "Falha ao carregar página de edição: status %s",
+                response.status if response and hasattr(response, "status") else "sem response",
+            )
+            return False, "Falha carregando página de edição"
+
+        # 2. Extrai CSRF token (os dois nomes mais comuns no Tray/Laravel)
+        csrf_token = None
+        for selector in [
+            'input[name="_token"]',
+            'input[name="__RequestVerificationToken"]',
+            'meta[name="csrf-token"]',
+        ]:
+            try:
+                elem = page.locator(selector).first
+                if elem.count() > 0:
+                    if selector.startswith('meta'):
+                        csrf_token = elem.get_attribute("content")
+                    else:
+                        csrf_token = elem.get_attribute("value")
+                    if csrf_token:
+                        _logger.info("🔒 CSRF token encontrado (%s): %s...", selector, str(csrf_token)[:20])
+                        break
+            except Exception:
+                continue
+
+        if not csrf_token:
+            _logger.warning("⚠️ Nenhum CSRF token encontrado na página — enviando sem (pode falhar)")
+
+        # 3. Monta payload exatamente como o form real envia
+        payload = {
+            "_method": "POST",
+            "id_produto": str(product_id),
+            "data[AdditionalProductInfo][herda_prazo]": "0",
+            "data[AdditionalProductInfo][prazo]": "0",
+        }
+
+        # selected_items[] — formato indexado (muito comum no Tray)
+        for i, info_id in enumerate(info_ids_to_link):
+            payload[f"selected_items[{i}]"] = str(info_id)
+
+        # sort[] — mantém ordem enviada ou default
+        if sort_entries:
+            for i, s in enumerate(sort_entries):
+                payload[f"sort[{i}]"] = s
+        else:
+            for i, info_id in enumerate(info_ids_to_link):
+                payload[f"sort[{i}]"] = f"{info_id}-"
+
+        # option_info[] — as opções checked (ex: 2839-951)
+        if option_info_entries:
+            for i, entry in enumerate(option_info_entries):
+                payload[f"option_info[{i}]"] = entry
+
+        # Adiciona CSRF se encontrado
+        if csrf_token:
+            payload["_token"] = csrf_token
+
+        # Campos extras comuns no Tray (commit, etc.)
+        payload["commit"] = "Salvar"
+        payload["action"] = "edit"
+
+        # =========================
+        # Limpeza prévia: desmarcar tudo antes de enviar os selecionados
+        # =========================
+        try:
+            _logger.info("Enviando POST de limpeza (desmarcar tudo)...")
+            clean_payload = {
+                "_method": "POST",
+                "id_produto": str(product_id),
+                "data[AdditionalProductInfo][herda_prazo]": "0",
+                "data[AdditionalProductInfo][prazo]": "0",
+            }
+            # incluir selected_items com os mesmos índices (o objetivo é forçar regravação)
+            for i, sid in enumerate(info_ids_to_link):
+                clean_payload[f"selected_items[{i}]"] = str(sid)
+            # manter sort se houver
+            for i, s in enumerate(sort_entries or []):
+                clean_payload[f"sort[{i}]"] = s
+            if csrf_token:
+                clean_payload["_token"] = csrf_token
+            clean_payload["commit"] = "Salvar"
+            clean_payload["action"] = "edit"
+
+            # garantir UTF-8 no urlencode da limpeza
+            clean_body = urlencode(clean_payload, doseq=True, encoding="utf-8")
+
+            # enviar via fetch usando headers com charset
+            clean_result = page.evaluate(
+                """
+                async ([url, body, origin]) => {
+                    try {
+                        const response = await fetch(url, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'Referer': url,
+                                'Origin': origin
+                            },
+                            body: body,
+                            credentials: 'include',
+                            redirect: 'follow'
+                        });
+                        const text = await response.text();
+                        return {
+                            ok: response.ok,
+                            status: response.status,
+                            redirected: response.redirected,
+                            finalUrl: response.url,
+                            snippet: text.substring(0, 400)
+                        };
+                    } catch (err) {
+                        return { error: err.message };
+                    }
+                }
+                """,
+                [edit_url, clean_body, DESTINO_BASE.rstrip("/")],
+            )
+
+            if isinstance(clean_result, dict):
+                c_status = clean_result.get("status", 0)
+                _logger.info("Resultado limpeza: status=%s ok=%s snippet_len=%d", c_status, clean_result.get("ok"), len(clean_result.get("snippet") or ""))
+            else:
+                _logger.warning("Resultado inesperado na limpeza: %r", clean_result)
+        except Exception as e:
+            _logger.warning("Erro durante POST de limpeza: %s", e)
+
+        # esperar propagation após limpeza (4-5s recomendado)
+        time.sleep(5)
+
+        # Converte para string urlencoded (forçando UTF-8)
+        body_str = urlencode(payload, doseq=True, encoding="utf-8")
+
+        _logger.debug(
+            "POST payload completo (urlencoded): %s",
+            body_str[:1200] + "..." if len(body_str) > 1200 else body_str,
+        )
+        _logger.info(
+            "Enviando POST com %d campos + %d opções marcadas",
+            len(info_ids_to_link),
+            len(option_info_entries or []),
+        )
+
+        # 4. Envia via fetch no evaluate (mantém cookies/sessão do Playwright)
         result = page.evaluate(
             """
-            async ([url, body]) => {
+            async ([url, body, origin]) => {
                 try {
-                    const resp = await fetch(url, {
+                    const response = await fetch(url, {
                         method: 'POST',
-                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'Referer': url,
+                            'Origin': origin
+                        },
                         body: body,
-                        redirect: 'follow',
                         credentials: 'include',
+                        redirect: 'follow'
                     });
+                    const text = await response.text();
                     return {
-                        status: resp.status, ok: resp.ok,
-                        redirected: resp.redirected,
-                        finalUrl: resp.url,
-                        snippet: (await resp.text()).substring(0, 300),
+                        ok: response.ok,
+                        status: response.status,
+                        redirected: response.redirected,
+                        finalUrl: response.url,
+                        snippet: text.substring(0, 400)
                     };
-                } catch(e) { return {status: 0, error: e.message}; }
+                } catch (err) {
+                    return { error: err.message };
+                }
             }
             """,
-            [endpoint, body],
+            [edit_url, body_str, DESTINO_BASE.rstrip("/")],
         )
 
-        status    = int(result.get("status") or 0)
-        redirected = bool(result.get("redirected"))
-        final_url  = str(result.get("finalUrl") or "")
-        snippet    = str(result.get("snippet") or "")
-        snippet_lower   = snippet.lower()
-        final_url_lower = final_url.lower()
+        if not isinstance(result, dict):
+            _logger.error("Resultado inesperado do evaluate/fetch: %r", result)
+            return False, "Resultado inesperado do fetch"
 
-        redirected_to_login = any(
-            p in final_url_lower
-            for p in ["/admin/login", "/mvc/adm/login", "/adm/login", "/login?", "/login#"]
-        )
-        login_in_html = any(
-            p in snippet_lower
-            for p in ['type="password"', "type='password'", 'name="password"', "name='password'"]
-        )
+        status = result.get("status", 0)
+        ok = result.get("ok", False) and status in (200, 302, 201)
+        redirected = result.get("redirected", False)
+        final_url = result.get("finalUrl", "") or ""
+        snippet = result.get("snippet", "") or ""
 
-        ok = (
-            (status in (200, 302) or bool(result.get("ok")))
-            and not redirected_to_login
-            and not login_in_html
-        )
-        detail = f"status={status}, redirected={redirected}, final={final_url}"
+        detail = f"status={status}, ok={ok}, redirected={redirected}, final={final_url}, snippet_len={len(snippet)}"
 
-        if not ok and not snippet.strip():
-            detail += ", empty-response"
-        if redirected_to_login or login_in_html:
-            detail += ", REDIRECT_LOGIN"
-            _logger.error(
-                "🚨 Sessão expirada! POST produto %s → login", product_id
-            )
+        if "login" in final_url.lower() or "password" in snippet.lower():
+            detail += " → POSSÍVEL REDIRECT PARA LOGIN"
+            _logger.error("Sessão inválida detectada no POST additional infos")
+
+        _logger.info("POST additional_infos → %s", detail)
+
+        # 5. Validação pós-envio (delay + reload + reconsulta)
+        if ok:
+            _logger.info("POST aparentemente aceito → aguardando propagação no Tray...")
+            time.sleep(6)  # Tray pode demorar para refletir no banco
+            try:
+                page.reload(wait_until="networkidle", timeout=20000)
+                time.sleep(3)
+            except Exception as e:
+                _logger.warning("Reload falhou: %s", str(e))
+
+            # Retorna True só se realmente salvou (evita falso-positivo)
+            try:
+                atuais = get_product_current_infos(page, product_id, _logger)
+            except Exception as e:
+                _logger.warning("Falha ao consultar infos atuais após POST: %s", e)
+                return False, detail + " | VALIDACAO_IMPOSSIVEL"
+
+            # normalizar tipos (strings)
+            atuais_set = {str(x) for x in (atuais or [])}
+            esperado_set = {str(x) for x in (info_ids_to_link or [])}
+
+            if atuais_set == esperado_set:
+                _logger.info("✅ Validação pós-POST: campos salvos corretamente (%d)", len(atuais_set))
+                return True, detail + " | VALIDADO_OK"
+            else:
+                _logger.warning(
+                    "⚠️ Campos NÃO salvos após POST: esperados=%s, atuais=%s",
+                    sorted(list(esperado_set)),
+                    sorted(list(atuais_set)),
+                )
+                return False, detail + " | VALIDADO_FALHOU"
 
         return ok, detail
+
     except Exception as exc:
+        _logger.error("❌ Erro geral em post_additional_infos: %s", str(exc))
         return False, str(exc)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Variações, Propriedades (sem alterações além de logs extras)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_destino_variants(
-    page: Page, product_id: str, token: str, logger
-) -> Tuple[list, dict]:
-    all_variants = []
-    page_num     = 1
-
-    while True:
-        url = (
-            f"{DESTINO_BASE}/admin/api/products/{product_id}/variants"
-            f"?sort=order&page[size]=25&page[number]={page_num}"
-        )
-        try:
-            resp = page.request.get(url, headers=api_headers(token))
-            if resp.status != 200:
-                logger.warning(
-                    "GET variants %s pág %d: status %d",
-                    product_id, page_num, resp.status,
-                )
-                break
-            data  = resp.json()
-            items = data.get("data", [])
-            if not items:
-                break
-            all_variants.extend(items)
-            paging      = data.get("paging", {})
-            total       = paging.get("total", 0)
-            total_pages = max(1, (total + 24) // 25)
-            if page_num >= total_pages:
-                break
-            page_num += 1
-            time.sleep(random.uniform(0.3, 0.5))
-        except Exception as exc:
-            logger.warning("Erro GET variants pág %d: %s", page_num, exc)
-            break
-
-    logger.info(
-        "📦 Produto %s: %d variações no DESTINO", product_id, len(all_variants)
-    )
-    return all_variants, {}
-
-
-def get_destino_properties(
-    page: Page, token: str, logger
-) -> Dict[str, str]:
-    prop_map: Dict[str, str] = {}
-    page_num = 1
-    while True:
-        url = (
-            f"{DESTINO_BASE}/admin/api/properties"
-            f"?sort=id&page[size]=25&page[number]={page_num}"
-        )
-        try:
-            resp = page.request.get(url, headers=api_headers(token))
-            if resp.status != 200:
-                break
-            data  = resp.json()
-            items = data.get("data", [])
-            if not items:
-                break
-            for item in items:
-                name    = (item.get("name") or "").strip()
-                prop_id = item.get("id")
-                if name and prop_id:
-                    prop_map[normalize(name)] = str(prop_id)
-            total       = data.get("paging", {}).get("total", 0)
-            total_pages = max(1, (total + 24) // 25)
-            if page_num >= total_pages:
-                break
-            page_num += 1
-            time.sleep(random.uniform(0.3, 0.5))
-        except Exception as exc:
-            logger.warning("Erro GET properties pág %d: %s", page_num, exc)
-            break
-    logger.info("🏷️ Propriedades DESTINO: %d", len(prop_map))
-    return prop_map
-
-
-def get_property_values(
-    page: Page, property_id: str, token: str, logger
-) -> Dict[str, str]:
-    url = f"{DESTINO_BASE}/admin/api/properties/{property_id}"
-    try:
-        resp = page.request.get(url, headers=api_headers(token))
-        if resp.status != 200:
-            return {}
-        data      = resp.json()
-        prop_data = data.get("data", {})
-        values: Dict[str, str] = {}
-        for pv in (prop_data.get("PropertyValues") or []):
-            name = (pv.get("name") or "").strip()
-            vid  = pv.get("id")
-            if name and vid:
-                values[normalize(name)] = str(vid)
-        return values
-    except Exception as exc:
-        logger.warning(
-            "Erro GET property %s values: %s", property_id, exc
-        )
-        return {}
-
-
-def append_property_value(
-    page: Page, property_id: str, value_name: str, token: str, logger
-) -> Optional[str]:
-    url     = f"{DESTINO_BASE}/admin/api/properties/{property_id}/append-values"
-    payload = {"data": {"name": value_name}}
-    try:
-        resp = page.request.post(
-            url=url,
-            data=json.dumps(payload),
-            headers=api_headers(token),
-        )
-        if resp.status == 200:
-            data = resp.json()
-            for pv in reversed(data.get("data", {}).get("PropertyValues", [])):
-                if normalize(pv.get("name", "")) == normalize(value_name):
-                    vid = str(pv["id"])
-                    logger.info("    ✅ Valor '%s' → ID %s", value_name, vid)
-                    return vid
-            pvs = data.get("data", {}).get("PropertyValues", [])
-            if pvs:
-                return str(pvs[-1]["id"])
-        else:
-            body = ""
-            try:
-                body = resp.text()[:300]
-            except Exception:
-                pass
-            logger.error(
-                "    ❌ append-values: status %d — %s", resp.status, body
-            )
-    except Exception as exc:
-        logger.error("    ❌ append-values erro: %s", exc)
-    return None
-
-
-def delete_variant(
-    page: Page, variant_id: str, token: str, logger
-) -> bool:
-    url = f"{DESTINO_BASE}/admin/api/products-variants/{variant_id}"
-    try:
-        resp = page.request.delete(url, headers=api_headers(token))
-        if resp.status == 204:
-            logger.info("    🗑️ Variação %s deletada", variant_id)
-            return True
-        logger.warning(
-            "    ❌ DELETE variação %s: status %d", variant_id, resp.status
-        )
-        return False
-    except Exception as exc:
-        logger.error("    ❌ DELETE variação %s erro: %s", variant_id, exc)
-        return False
-
-
-def put_variants(
-    page: Page, product_id: str, variants_payload: list, token: str
-) -> Tuple[bool, int, str]:
-    url = f"{DESTINO_BASE}/admin/api/products/{product_id}/variants"
-    try:
-        resp = page.request.put(
-            url=url,
-            data=json.dumps({"data": variants_payload}),
-            headers=api_headers(token),
-        )
-        body = ""
-        try:
-            body = resp.text()[:500]
-        except Exception:
-            pass
-        return resp.ok, resp.status, body
-    except Exception as exc:
-        return False, 0, str(exc)
-
-
-def post_variants(
-    page: Page, product_id: str, variants_payload: list, token: str
-) -> Tuple[bool, int, str]:
-    url = f"{DESTINO_BASE}/admin/api/products/{product_id}/variants"
-    try:
-        resp = page.request.post(
-            url=url,
-            data=json.dumps({"data": variants_payload}),
-            headers=api_headers(token),
-        )
-        body = ""
-        try:
-            body = resp.text()[:500]
-        except Exception:
-            pass
-        return resp.ok, resp.status, body
-    except Exception as exc:
-        return False, 0, str(exc)

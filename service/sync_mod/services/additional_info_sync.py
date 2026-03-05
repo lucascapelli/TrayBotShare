@@ -1,4 +1,4 @@
-#additional_info_sync.py
+# additional_info_sync.py (ATUALIZADO)
 import logging
 import time
 from typing import Dict, List, Optional
@@ -28,45 +28,30 @@ def sync_additional_infos(
     medium_delay,
     create_missing_fields: bool = False,
     source_context: str = "origem_infos",
-    # ── Dados de opções checked da ORIGEM ──
     origin_checked_options: Optional[Dict[str, List[str]]] = None,
 ):
-    """
-    Sincroniza informações adicionais de um produto.
-
-    FLUXO:
-    1. Determina quais CAMPOS vincular (selected_items[])
-    2. Determina quais OPÇÕES marcar (option_info[])
-       → Se origin_checked_options disponível: usa APENAS as marcadas na ORIGEM
-       → Senão: usa todas do JSON (fallback)
-    3. Envia POST único com campos + opções corretos
-    """
     _log_section("SYNC INFORMAÇÕES ADICIONAIS")
 
     if not origem_infos:
-        logger.info("ℹ️ Produto ORIGEM não tem informações adicionais — pulando")
-        log_entry["infos_adicionais"] = {"status": "sem_infos_origem"}
+        logger.info("ℹ️ Nenhuma informação adicional para sincronizar (lista vazia)")
+        log_entry["infos_adicionais"] = {"status": "lista_vazia", "source": source_context}
         return
 
     origem_infos = domain.fix_opcao_banho_list(origem_infos)
 
     info_catalog = destino_api.fetch_all_additional_infos_catalog(page, token, logger=logger)
     if not info_catalog:
+        logger.warning("Catálogo de Additional Infos vazio no destino")
         if not create_missing_fields:
-            logger.warning("⚠️ Catálogo de infos do DESTINO vazio — impossível sincronizar")
             log_entry["infos_adicionais"] = {"status": "catalogo_vazio"}
             return
-        logger.warning("⚠️ Catálogo vazio + create_missing_fields=True → tentando criar...")
 
-    # ══════════════════════════════════════════════════════════════════════
-    # ETAPA 1: Preparar campos + opções
-    # ══════════════════════════════════════════════════════════════════════
     ids_desejados = []
     sort_entries = []
-    option_info_entries = []  # formato: "OPTION_ID-FIELD_ID"
+    option_info_entries = []  # "OPTION_ID-FIELD_ID"
     nao_encontrados = []
     opcoes_nao_encontradas = {}
-    opcoes_stats = {}  # para log
+    opcoes_stats = {}
 
     for info in origem_infos:
         nome = domain.fix_opcao_banho_str((info.get("nome") or "").strip())
@@ -75,20 +60,25 @@ def sync_additional_infos(
 
         norm_nome = domain.normalize(nome)
         destino_info = info_catalog.get(norm_nome)
-        destino_id = destino_info.get("id") if isinstance(destino_info, dict) else None
+        destino_id = destino_info.get("id") if destino_info else None
 
         opcoes_origem = info.get("opcoes") or []
-        opcoes_nomes = [
-            (op.get("nome") or "").strip()
-            for op in opcoes_origem
-            if (op.get("nome") or "").strip()
-        ]
+        opcoes_nomes = [op.get("nome", "").strip() for op in opcoes_origem if op.get("nome", "").strip()]
 
-        # Criar campo/opções faltantes
-        if create_missing_fields and ((not destino_info) or (opcoes_nomes and isinstance(destino_info, dict))):
-            logger.info("    🔧 Garantindo campo '%s' com %d opções...", nome, len(opcoes_nomes))
+        # Detectar textual: sem opções reais ou apenas a opção dummy "Valor padrão"
+        is_textual = (
+            len(opcoes_origem) == 0
+            or all(("Valor padrão" in (o.get("nome") or "") or "valor padrão" in (o.get("nome") or "").lower())
+                   for o in opcoes_origem)
+        )
+        # field_type: "T" = textarea/textual, "I" = input (single-line), "S" = select/options
+        field_type = "T" if is_textual else "S"
+
+        # Criar campo + opções se permitido
+        if create_missing_fields and (not destino_id or (opcoes_nomes and destino_info)):
+            logger.info("Criando/garantindo campo '%s' tipo=%s com %d opções", nome, field_type, len(opcoes_nomes))
             ensured = destino_api.ensure_additional_info_with_options(
-                page, token, nome, opcoes_nomes, logger=logger,
+                page, token, nome, opcoes_nomes, logger=logger, field_type=field_type
             )
             if ensured:
                 destino_info = ensured
@@ -97,114 +87,53 @@ def sync_additional_infos(
 
         if not destino_id:
             nao_encontrados.append(nome)
-            logger.warning("    ❌ '%s' NÃO existe no catálogo DESTINO", nome)
+            logger.warning("Campo '%s' não existe no catálogo do destino", nome)
             continue
 
         ids_desejados.append(destino_id)
         sort_entries.append(f"{destino_id}-")
-        logger.info("    ✅ '%s' → DESTINO ID %s", nome, destino_id)
+        logger.info("Campo '%s' → ID destino %s (tipo=%s)", nome, destino_id, field_type)
 
-        # ══════════════════════════════════════════════════════════════
-        # CRITICAL FIX: Determinar quais OPÇÕES marcar
-        #
-        # Se temos origin_checked_options → usar APENAS as marcadas
-        # Senão → fallback: usar todas do JSON (pode marcar demais)
-        # ══════════════════════════════════════════════════════════════
-        option_map = destino_info.get("option_map") if isinstance(destino_info, dict) else {}
-        if not isinstance(option_map, dict):
-            option_map = {}
+        # Decidir quais opções marcar — pular marcação se campo textual
+        option_map = destino_info.get("option_map", {}) if destino_info else {}
+        matched = 0
+
+        if field_type == "T":
+            # textual: não marcar opções (não faz sentido)
+            logger.debug("Campo '%s' é textual → não serão marcadas opções", nome)
+            opcoes_stats[nome] = {"mapped": 0, "total_origem": len(opcoes_nomes), "tipo": "textual"}
+            continue
 
         if origin_checked_options and norm_nome in origin_checked_options:
-            checked_labels = origin_checked_options[norm_nome]
-            logger.info(
-                "    📌 MODO PRECISO (Variações → Checkboxes): '%s' → %d opções marcadas: %s",
-                nome, len(checked_labels), checked_labels[:10]
-            )
-            matched = 0
-            unmatched = []
-            for label in checked_labels:
+            checked = origin_checked_options[norm_nome]
+            logger.info("Modo preciso: '%s' → %d opções marcadas na origem", nome, len(checked))
+            for label in checked:
                 label_clean = label.strip()
-                destino_option_id = option_map.get(domain.normalize(label_clean))
-                if destino_option_id:
-                    option_info_entries.append(f"{destino_option_id}-{destino_id}")
+                opt_id = option_map.get(domain.normalize(label_clean))
+                if opt_id:
+                    option_info_entries.append(f"{opt_id}-{destino_id}")
                     matched += 1
                 else:
-                    unmatched.append(label_clean)
-            if unmatched:
-                opcoes_nao_encontradas[nome] = unmatched
-                logger.warning("    ⚠️ Opções sem match no DESTINO: %s", unmatched[:10])
-
-            opcoes_stats[nome] = {
-                "mode": "precise",
-                "origin_checked": len(checked_labels),
-                "mapped": matched,
-                "unmatched": len(unmatched),
-            }
-
+                    opcoes_nao_encontradas.setdefault(nome, []).append(label_clean)
         elif opcoes_nomes:
-            # ── Modo FALLBACK: usar TODAS as opções do JSON ──
-            matched = 0
-            for opcao_nome in opcoes_nomes:
-                destino_option_id = option_map.get(domain.normalize(opcao_nome))
-                if destino_option_id:
-                    option_info_entries.append(f"{destino_option_id}-{destino_id}")
+            logger.info("Modo fallback: '%s' → marcando todas %d opções do JSON", nome, len(opcoes_nomes))
+            for op_nome in opcoes_nomes:
+                opt_id = option_map.get(domain.normalize(op_nome))
+                if opt_id:
+                    option_info_entries.append(f"{opt_id}-{destino_id}")
                     matched += 1
                 else:
-                    opcoes_nao_encontradas.setdefault(nome, []).append(opcao_nome)
+                    opcoes_nao_encontradas.setdefault(nome, []).append(op_nome)
 
-            logger.info(
-                "    ⚠️ MODO FALLBACK para '%s': %d opções do JSON → %d mapeadas (PODE MARCAR DEMAIS!)",
-                nome, len(opcoes_nomes), matched,
-            )
-            opcoes_stats[nome] = {
-                "mode": "fallback_all_json",
-                "total_json": len(opcoes_nomes),
-                "mapped": matched,
-            }
+        opcoes_stats[nome] = {"mapped": matched, "total_origem": len(opcoes_nomes), "tipo": ("select" if not is_textual else "textual")}
 
     if not ids_desejados:
-        logger.warning("⚠️ Nenhuma info para vincular")
-        log_entry["infos_adicionais"] = {
-            "status": "nenhum_id_encontrado",
-            "nao_encontrados_no_catalogo": nao_encontrados,
-        }
+        logger.warning("Nenhum campo pôde ser vinculado")
+        log_entry["infos_adicionais"] = {"status": "nenhum_campo_vinculado", "nao_encontrados": nao_encontrados}
         return
 
-    # ══════════════════════════════════════════════════════════════════════
-    # ETAPA 2: Verificar estado atual
-    # ══════════════════════════════════════════════════════════════════════
-    ids_atuais = destino_api.get_product_current_infos(page, product_id, logger=logger)
-
-    set_desejados = set(ids_desejados)
-    set_atuais = set(ids_atuais)
-
-    a_adicionar = set_desejados - set_atuais
-    a_remover = set_atuais - set_desejados
-
-    logger.info("📊 Campos: desejados=%s atuais=%s", sorted(set_desejados), sorted(set_atuais))
-    logger.info("    +adicionar=%s -remover=%s", sorted(a_adicionar), sorted(a_remover))
-
-    # Verificar se opções mudaram (mesmo que campos estejam corretos)
-    fields_changed = (set_desejados != set_atuais)
-    has_options = bool(option_info_entries)
-
-    # SEMPRE enviar POST se temos option_info_entries — garante que as opções
-    # sejam atualizadas mesmo quando os campos já estão corretos
-    needs_post = fields_changed or has_options
-
-    if not needs_post:
-        logger.info("✅ Campos e opções já corretos — nada a fazer")
-        log_entry["infos_adicionais"] = {
-            "status": "ja_correto",
-            "ids": sorted(set_desejados),
-            "origem": source_context,
-        }
-        return
-
-    # ══════════════════════════════════════════════════════════════════════
-    # ETAPA 3: Enviar POST com campos + opções
-    # ══════════════════════════════════════════════════════════════════════
-    logger.info("📤 Enviando POST: %d campos + %d option_info entries", len(ids_desejados), len(option_info_entries))
+    logger.debug("Preparando POST: ids=%s | sort=%s | option_info=%s", ids_desejados, sort_entries, option_info_entries)
+    logger.info("Enviando POST com %d campos e %d opções marcadas", len(ids_desejados), len(option_info_entries))
     medium_delay()
 
     ok, detail = destino_api.post_additional_infos(
@@ -217,79 +146,24 @@ def sync_additional_infos(
     )
 
     if ok:
-        short_delay()
-
-        # Pós-validação dos campos
-        ids_pos = destino_api.get_product_current_infos(page, product_id, logger=logger)
-        set_pos = set(ids_pos)
-        campos_ok = (set_pos == set_desejados)
-
-        if campos_ok:
-            logger.info("✅ Campos corretos após POST (%s)", detail)
-        else:
-            logger.warning("⚠️ Campos divergentes: esperado=%s atual=%s", sorted(set_desejados), sorted(set_pos))
-            # Retry
-            medium_delay()
-            ok2, detail2 = destino_api.post_additional_infos(
-                page, product_id, ids_desejados,
-                short_delay=short_delay,
-                sort_entries=sort_entries,
-                option_info_entries=option_info_entries,
-            )
-            if ok2:
-                short_delay()
-                ids_pos2 = destino_api.get_product_current_infos(page, product_id, logger=logger)
-                set_pos = set(ids_pos2)
-                campos_ok = (set_pos == set_desejados)
-                if campos_ok:
-                    logger.info("✅ Campos corretos após retry")
-
-        # Pós-validação das opções (se tínhamos modo preciso)
-        opcoes_ok = True
-        if origin_checked_options:
-            short_delay()
-            destino_checked = destino_api.get_product_current_checked_options(page, product_id, logger=logger)
-            if destino_checked:
-                for norm_name, expected_labels in origin_checked_options.items():
-                    actual_labels = destino_checked.get(norm_name, [])
-                    expected_set = {l.strip().lower() for l in expected_labels if l.strip()}
-                    actual_set = {l.strip().lower() for l in actual_labels if l.strip()}
-                    if expected_set != actual_set:
-                        extra = actual_set - expected_set
-                        missing = expected_set - actual_set
-                        logger.warning(
-                            "⚠️ Opções divergentes para '%s': extra=%s faltando=%s",
-                            norm_name, sorted(extra)[:5], sorted(missing)[:5],
-                        )
-                        opcoes_ok = False
-                    else:
-                        logger.info("✅ Opções de '%s' corretas (%d)", norm_name, len(expected_set))
-
-        status_final = "atualizado"
-        if not campos_ok:
-            status_final = "atualizado_com_divergencia_campos"
-        elif not opcoes_ok:
-            status_final = "atualizado_com_divergencia_opcoes"
-
+        logger.info("POST AdditionalInfos OK → %s", detail)
+        # Validação pós-envio
+        time.sleep(2)
+        atuais = destino_api.get_product_current_infos(page, product_id, logger=logger)
         log_entry["infos_adicionais"] = {
-            "status": status_final,
-            "ids_vinculados": ids_desejados,
-            "campos_adicionados": sorted(a_adicionar),
-            "campos_removidos": sorted(a_remover),
-            "option_info_enviado": len(option_info_entries),
-            "opcoes_stats": opcoes_stats,
-            "nao_encontrados_no_catalogo": nao_encontrados,
-            "opcoes_nao_encontradas": opcoes_nao_encontradas,
-            "ids_pos_update": sorted(set_pos),
-            "origem": source_context,
-            "detail": detail,
+            "status": "sucesso",
+            "ids_enviados": ids_desejados,
+            "ids_atuais_pos": atuais,
+            "opcoes_enviadas": len(option_info_entries),
+            "source": source_context,
+            "stats": opcoes_stats,
+            "nao_encontrados": nao_encontrados,
+            "opcoes_nao_mapeadas": opcoes_nao_encontradas,
         }
     else:
-        logger.error("❌ Falha POST infos adicionais: %s", detail)
+        logger.error("Falha no POST AdditionalInfos: %s", detail)
         log_entry["infos_adicionais"] = {
-            "status": "falha",
-            "detalhe": detail,
-            "nao_encontrados_no_catalogo": nao_encontrados,
-            "opcoes_nao_encontradas": opcoes_nao_encontradas,
-            "origem": source_context,
+            "status": "falha_post",
+            "detail": detail,
+            "ids_tentados": ids_desejados,
         }

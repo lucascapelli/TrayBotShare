@@ -1,9 +1,10 @@
-#domain.py
+# domain.py
 import logging
 import unicodedata
 from typing import Dict, List
 
 logger = logging.getLogger("sync")
+
 
 def fix_opcao_banho_str(nome: str) -> str:
     if not nome:
@@ -21,15 +22,12 @@ def fix_opcao_banho_str(nome: str) -> str:
         return canonical
     return nome
 
+
 def fix_opcao_banho_list(infos: list) -> list:
     if not infos:
         return infos
-    fixed = []
-    for info in infos:
-        copia = dict(info)
-        copia["nome"] = fix_opcao_banho_str(copia.get("nome", ""))
-        fixed.append(copia)
-    return fixed
+    return [{**info, "nome": fix_opcao_banho_str(info.get("nome", ""))} for info in infos]
+
 
 def normalize(name: str) -> str:
     if not name:
@@ -38,13 +36,13 @@ def normalize(name: str) -> str:
     nfkd = unicodedata.normalize("NFKD", raw)
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
+
 def canonical_info_name(nome: str) -> str:
     if not nome:
         return ""
     nome = str(nome).strip()
     lower = nome.lower()
     
-    # Regra forte para anéis
     if any(k in lower for k in [
         "tamanho do aro", "tamanho aro", "tam aro", "aro", 
         "medida aro", "tamanho do anel", "tamanho anel", "medida anel"
@@ -52,19 +50,16 @@ def canonical_info_name(nome: str) -> str:
         logger.info("🔄 CANONICAL ARO: '%s' → 'Tamanho do Aro'", nome)
         return "Tamanho do Aro"
     
-    # Mantém fix do banho
     return fix_opcao_banho_str(nome)
 
-# ══════════════════════════════════════════════════════════════════════
-# EXTRAIR SKU ITEMS de uma variação (aceita múltiplos formatos Tray)
-# ══════════════════════════════════════════════════════════════════════
+
 def _extract_sku_items_from_variant(variacao: dict) -> list:
     if not isinstance(variacao, dict):
         return []
-    # Formato 1/2: "sku" ou "Sku" com type/value
+    
     for key in ("sku", "Sku"):
         items = variacao.get(key)
-        if isinstance(items, list) and items:
+        if isinstance(items, list):
             result = []
             for item in items:
                 if not isinstance(item, dict):
@@ -75,163 +70,142 @@ def _extract_sku_items_from_variant(variacao: dict) -> list:
                     result.append({"type": tipo, "value": valor})
             if result:
                 return result
-    # Formato 3/4: "PropertyValue" ou "VariantPropertyValue"
+    
     for key in ("PropertyValue", "VariantPropertyValue", "property_value"):
         items = variacao.get(key)
-        if isinstance(items, list) and items:
+        if isinstance(items, list):
             result = []
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                tipo = (
-                    item.get("property_name")
-                    or item.get("type")
-                    or item.get("name")
-                    or ""
-                ).strip()
-                valor = (
-                    item.get("value")
-                    or item.get("name")
-                    or ""
-                ).strip()
+                tipo = (item.get("property_name") or item.get("type") or item.get("name") or "").strip()
+                valor = (item.get("value") or item.get("name") or "").strip()
                 if tipo and valor and tipo != valor:
                     result.append({"type": tipo, "value": valor})
-                elif tipo and not valor:
-                    val2 = (item.get("name") or "").strip()
-                    if val2 and val2 != tipo:
-                        result.append({"type": tipo, "value": val2})
             if result:
                 return result
+    
     return []
+
 
 def build_additional_infos_from_variacoes(origem_variacoes: list) -> list:
     grouped = {}
     for variacao in origem_variacoes or []:
-        if not isinstance(variacao, dict):
-            continue
         sku_items = _extract_sku_items_from_variant(variacao)
         for sku_item in sku_items:
-            info_nome = canonical_info_name((sku_item.get("type") or "").strip())
-            option_nome = (sku_item.get("value") or "").strip()
+            info_nome = canonical_info_name(sku_item.get("type", "").strip())
+            option_nome = sku_item.get("value", "").strip()
             if not info_nome or not option_nome:
                 continue
-            info_key = normalize(info_nome)
-            if info_key not in grouped:
-                grouped[info_key] = {
-                    "nome": info_nome,
-                    "opcoes": {},
-                }
-            option_key = normalize(option_nome)
-            grouped[info_key]["opcoes"][option_key] = {
-                "nome": option_nome,
-                "valor": "0.00",
-            }
-    result = []
-    for item in grouped.values():
-        result.append(
-            {
-                "nome": item["nome"],
-                "opcoes": list(item["opcoes"].values()),
-            }
-        )
+            key = normalize(info_nome)
+            grouped.setdefault(key, {"nome": info_nome, "opcoes": {}})
+            op_key = normalize(option_nome)
+            grouped[key]["opcoes"][op_key] = {"nome": option_nome, "valor": "0.00"}
+    
+    result = [{"nome": v["nome"], "opcoes": list(v["opcoes"].values())} for v in grouped.values()]
     if result:
-        logger.info(
-            "🔄 Variações → %d campos de info adicional: %s",
-            len(result),
-            [(r["nome"], len(r["opcoes"])) for r in result],
-        )
+        logger.info("🔄 build_additional_infos_from_variacoes → %d campos gerados: %s", len(result), [r["nome"] for r in result])
+    else:
+        logger.info("build_additional_infos_from_variacoes → nenhum campo gerado")
     return result
 
-def merge_additional_infos(origem_infos: list, infos_from_variacoes: list) -> list:
+
+def merge_additional_infos(origem_infos: list, variacoes_infos: list) -> list:
     merged = {}
-    for info in (origem_infos or []) + (infos_from_variacoes or []):
-        nome = canonical_info_name((info.get("nome") or "").strip())
+    for info in (origem_infos or []) + (variacoes_infos or []):
+        nome = canonical_info_name(info.get("nome", "").strip())
         if not nome:
             continue
         key = normalize(nome)
-        if key not in merged:
-            merged[key] = {"nome": nome, "opcoes": {}}
+        merged.setdefault(key, {"nome": nome, "opcoes": {}})
         for op in info.get("opcoes") or []:
             op_nome = (op.get("nome") or "").strip()
-            if not op_nome:
-                continue
-            op_key = normalize(op_nome)
-            merged[key]["opcoes"][op_key] = {
-                "nome": op_nome,
-                "valor": op.get("valor", "0.00"),
-            }
-    result = []
-    for item in merged.values():
-        result.append({"nome": item["nome"], "opcoes": list(item["opcoes"].values())})
+            if op_nome:
+                op_key = normalize(op_nome)
+                merged[key]["opcoes"][op_key] = op
+    result = [{"nome": v["nome"], "opcoes": list(v["opcoes"].values())} for v in merged.values()]
+    logger.info("merge_additional_infos → %d campos finais após merge", len(result))
     return result
 
+
+def _get_infos_from_product(produto: dict) -> list:
+    if not isinstance(produto, dict):
+        logger.warning("Produto ORIGEM não é dict válido")
+        return []
+
+    # Desembrulhar 'data' se existir
+    if "data" in produto and isinstance(produto["data"], dict):
+        produto = produto["data"]
+        logger.debug("Desembrulhado 'data' do produto origem")
+
+    candidates = [
+        produto.get("AdditionalInfos"),
+        produto.get("additional_infos"),
+        produto.get("informacoes_adicionais"),
+    ]
+
+    for infos in candidates:
+        if isinstance(infos, list) and infos:
+            logger.info("✅ Encontradas %d AdditionalInfos na origem", len(infos))
+            converted = []
+            for info in infos:
+                nome = (info.get("name") or info.get("nome") or "").strip()
+                if not nome:
+                    continue
+                opcoes = []
+                opts = info.get("options") or info.get("opcoes") or info.get("PropertyValue") or info.get("values") or []
+                for opt in opts:
+                    if not isinstance(opt, dict):
+                        continue
+                    opt_nome = (opt.get("name") or opt.get("nome") or opt.get("value") or "").strip()
+                    if opt_nome:
+                        opt_val = opt.get("value") or opt.get("price") or "0.00"
+                        opcoes.append({"nome": opt_nome, "valor": str(opt_val)})
+
+                # Preserve type and do NOT force dummy options for textual fields.
+                tipo_original = info.get("type", "text")
+                # antigo comportamento: criar opção dummy para text/textarea — REMOVIDO
+
+                converted.append({
+                    "nome": nome,
+                    "opcoes": opcoes,
+                    "tipo": tipo_original
+                })
+
+            if converted:
+                logger.info("Retornando %d infos convertidas", len(converted))
+                return converted
+
+    logger.info("Nenhuma AdditionalInfos textual encontrada na origem")
+    return []
+
+
+def _get_variacoes_from_product(produto: dict) -> list:
+    variacoes = produto.get("variacoes") or produto.get("Variant") or []
+    if isinstance(variacoes, list):
+        logger.info("Encontradas %d variações na origem", len(variacoes))
+        return variacoes
+    logger.info("Nenhuma variação encontrada na origem")
+    return []
+
+
 def build_infos_for_additional_model(origem_product: dict) -> list:
-    infos_origem = fix_opcao_banho_list(
-        _get_infos_from_product(origem_product)
-    )
+    infos_origem = fix_opcao_banho_list(_get_infos_from_product(origem_product))
     variacoes = _get_variacoes_from_product(origem_product)
     infos_variacoes = build_additional_infos_from_variacoes(variacoes)
+
+    # FORÇADO: priorizar variações se não houver infos textuais
+    if not infos_origem and infos_variacoes:
+        logger.info("FORÇADO: usando SOMENTE variações como AdditionalInfos (%d campos)", len(infos_variacoes))
+        return infos_variacoes
+
     merged = merge_additional_infos(infos_origem, infos_variacoes)
     logger.info(
-        "📦 build_infos_for_additional_model: %d infos origem + %d de variações = %d merged",
-        len(infos_origem), len(infos_variacoes), len(merged),
+        "build_infos_for_additional_model → %d textuais + %d variações = %d merged",
+        len(infos_origem), len(infos_variacoes), len(merged)
     )
     return merged
 
-def _get_infos_from_product(produto: dict) -> list:
-    infos = produto.get("informacoes_adicionais") or []
-    if infos and isinstance(infos, list):
-        first = infos[0] if infos else {}
-        if isinstance(first, dict) and (first.get("nome") or first.get("opcoes")):
-            return infos
-    tray = produto.get("AdditionalInfos") or []
-    if tray and isinstance(tray, list):
-        converted = []
-        for info in tray:
-            if not isinstance(info, dict):
-                continue
-            nome = (info.get("name") or "").strip()
-            if not nome:
-                continue
-            opcoes = []
-            for opt in (info.get("options") or []):
-                if isinstance(opt, dict):
-                    opt_nome = (opt.get("name") or "").strip()
-                    if opt_nome:
-                        opcoes.append({"nome": opt_nome, "valor": str(opt.get("value") or "0.00")})
-            converted.append({"nome": nome, "opcoes": opcoes})
-        if converted:
-            return converted
-    if infos and isinstance(infos, list):
-        first = infos[0] if infos else {}
-        if isinstance(first, dict) and first.get("name"):
-            converted = []
-            for info in infos:
-                if not isinstance(info, dict):
-                    continue
-                nome = (info.get("name") or "").strip()
-                if nome:
-                    opcoes = []
-                    for opt in (info.get("options") or []):
-                        if isinstance(opt, dict):
-                            opt_nome = (opt.get("name") or "").strip()
-                            if opt_nome:
-                                opcoes.append({"nome": opt_nome, "valor": "0.00"})
-                    converted.append({"nome": nome, "opcoes": opcoes})
-            return converted
-    return []
-
-def _get_variacoes_from_product(produto: dict) -> list:
-    variacoes = produto.get("variacoes") or []
-    if variacoes and isinstance(variacoes, list):
-        for v in variacoes:
-            if isinstance(v, dict) and _extract_sku_items_from_variant(v):
-                return variacoes
-    variants = produto.get("Variant") or []
-    if variants and isinstance(variants, list):
-        logger.info("🔄 Convertendo %d Variant (Tray) para formato interno", len(variants))
-        return variants
-    return variacoes if isinstance(variacoes, list) else []
 
 def api_headers(auth_token: str, content_type: str = "application/json") -> dict:
     headers = {
@@ -242,6 +216,7 @@ def api_headers(auth_token: str, content_type: str = "application/json") -> dict
     if auth_token:
         headers["Authorization"] = auth_token
     return headers
+
 
 def build_product_payload(origem: dict, destino_json: dict) -> dict:
     payload = {}
@@ -297,6 +272,7 @@ def build_product_payload(origem: dict, destino_json: dict) -> dict:
         payload["ProductImage"] = [{"https": img}]
     return payload
 
+
 def variant_sku_key(sku_list: list) -> str:
     if not sku_list:
         return ""
@@ -306,6 +282,7 @@ def variant_sku_key(sku_list: list) -> str:
         sku_value = normalize(sku_item.get("value", ""))
         parts.append(f"{sku_type}={sku_value}")
     return "|".join(parts)
+
 
 def map_name_to_id(items: list, name_keys: tuple[str, ...] = ("name",), id_key: str = "id") -> Dict[str, str]:
     mapped: Dict[str, str] = {}
@@ -329,10 +306,6 @@ def extract_checked_options_from_variants(
     cookies_origem=None,
     logger=None,
 ) -> Dict[str, List[str]]:
-    """
-    Extrai opções checked (valores selecionados) das variações da origem.
-    Prioriza o endpoint /products-variants?filter[product_id]=... que traz Sku com type/value.
-    """
     if not logger:
         logger = logging.getLogger("sync")
 
@@ -343,7 +316,6 @@ def extract_checked_options_from_variants(
         logger.warning("ID do produto não encontrado para extrair variações")
         return result
 
-    # === PRIORIDADE 1: Endpoint de listagem completa de variants por product_id ===
     if page and origin_base and cookies_origem:
         try:
             try:
@@ -371,7 +343,6 @@ def extract_checked_options_from_variants(
             if cookie_str:
                 headers["Cookie"] = cookie_str
 
-            # Tenta adicionar token se disponível (extraído da página)
             try:
                 if destino_api:
                     token = destino_api._extract_origin_token(page)
@@ -390,8 +361,6 @@ def extract_checked_options_from_variants(
                 if resp.status == 200:
                     data = resp.json()
                     variants = data.get("data", [])
-                    logger.info("✅ /products-variants retornou %d variações completas", len(variants))
-
                     for var in variants:
                         sku_items = _extract_sku_items_from_variant(var)
                         for item in sku_items:
@@ -406,49 +375,32 @@ def extract_checked_options_from_variants(
                                 result[norm_field].append(value)
 
                     if result:
-                        logger.info("🔄 [CHECKED PRECISO] Extraídos %d campos via /products-variants: %s", len(result), result)
+                        logger.info("🔄 [CHECKED PRECISO] Extraídos %d campos via /products-variants", len(result))
                         return result
-                    else:
-                        logger.warning("/products-variants retornou, mas sem valores extraíveis")
-                else:
-                    logger.warning("/products-variants status %d", resp.status)
             except Exception as exc:
                 logger.warning("Erro chamando /products-variants: %s", exc)
-
         except Exception:
             pass
 
-    # === FALLBACK: se não pegou via listagem, tenta enriquecer por ID individual (já existe) ===
+    # Fallback individual
     variacoes = _get_variacoes_from_product(origem_product)
     if not variacoes:
-        logger.warning("Nenhuma variação para extrair (nem via listagem nem individual)")
         return result
 
-    enriched = False
     for var in variacoes:
         var_id = str(var.get("id") or "")
         sku_items = _extract_sku_items_from_variant(var)
-
         if not sku_items and var_id and page and origin_base and cookies_origem:
-            logger.info("🔄 Enriquecendo variant ID %s individualmente", var_id)
             try:
-                try:
-                    from . import destino_api
-                except Exception:
-                    import service.sync_mod.destino_api as destino_api
-                details = destino_api.fetch_origin_variant_details(
-                    page=page,
-                    origin_base=origin_base,
-                    product_id=product_id,
-                    variant_id=var_id,
-                    cookies_origem=cookies_origem,
-                    logger=logger
-                )
-                if details:
-                    sku_items = _extract_sku_items_from_variant(details)
-                    enriched = True
+                if destino_api:
+                    details = destino_api.fetch_origin_variant_details(
+                        page=page, origin_base=origin_base, product_id=product_id,
+                        variant_id=var_id, cookies_origem=cookies_origem, logger=logger
+                    )
+                    if details:
+                        sku_items = _extract_sku_items_from_variant(details)
             except Exception:
-                logger.warning("Erro enriquecendo variant %s individualmente", var_id)
+                pass
 
         for item in sku_items:
             field_raw = (item.get("type") or "").strip()
@@ -460,13 +412,5 @@ def extract_checked_options_from_variants(
             result.setdefault(norm_field, [])
             if value not in result[norm_field]:
                 result[norm_field].append(value)
-
-    if enriched:
-        logger.info("✅ %d variações enriquecidas individualmente", len(variacoes))
-
-    if result:
-        logger.info("🔄 [CHECKED] %d campos: %s", len(result), result)
-    else:
-        logger.warning("⚠️ [CHECKED] Nenhum valor extraído (tentou listagem + individual)")
 
     return result

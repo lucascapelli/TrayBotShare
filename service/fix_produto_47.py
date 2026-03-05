@@ -43,17 +43,24 @@ def _load_origem_reference(product_id: str) -> Optional[dict]:
     except Exception as exc:
         logger.error("❌ Falha ao ler referência de ORIGEM: %s", exc)
         return None
-
-    if not isinstance(produtos, list):
-        logger.error("❌ Estrutura inválida em %s (esperado: lista)", ORIGEM_JSON_PATH)
-        return None
-
     pid = str(product_id)
-    for item in produtos:
-        if str(item.get("produto_id", "")) == pid:
-            return item
-        if str(item.get("id", "")) == pid:
-            return item
+
+    # Caso 1: formato antigo — lista de produtos
+    if isinstance(produtos, list):
+        for item in produtos:
+            if str(item.get("produto_id", "")) == pid or str(item.get("id", "")) == pid:
+                return item
+
+    # Caso 2: formato single-product — dict direto
+    elif isinstance(produtos, dict):
+        # produto no nível raiz
+        if str(produtos.get("produto_id", "")) == pid or str(produtos.get("id", "")) == pid:
+            return produtos
+        # produto dentro de chave 'data'
+        if "data" in produtos and isinstance(produtos["data"], dict):
+            inner = produtos["data"]
+            if str(inner.get("produto_id", "")) == pid or str(inner.get("id", "")) == pid:
+                return inner
 
     logger.error("❌ Produto de referência %s não encontrado em %s", pid, ORIGEM_JSON_PATH)
     return None
