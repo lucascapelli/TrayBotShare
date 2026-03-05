@@ -1,3 +1,4 @@
+#config.py
 RATE_LIMIT = 0 # 0 roda sem limite, outro numero limitam a execução ao número passado
 DESTINO_BASE = "https://www.grasielyatacado.com.br"
 

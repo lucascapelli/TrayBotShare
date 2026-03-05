@@ -1,4 +1,4 @@
-# ========================== run_sync.py (V8 — FIX OPÇÕES + COOKIES) ==========================
+#run_sync.py
 import json
 import logging
 import os
@@ -17,8 +17,7 @@ from service.sync_mod.services.variant_sync import sync_variants
 
 logger = logging.getLogger("sync")
 
-
-# ====================== RETRY DECORATOR ======================
+# ====================== RETRY ======================
 def retry_on_fail(max_attempts=3, backoff=1.5):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -36,7 +35,6 @@ def retry_on_fail(max_attempts=3, backoff=1.5):
         return wrapper
     return decorator
 
-
 # ====================== DELAYS ======================
 def _human_delay(min_s: float = 1.2, max_s: float = 3.0):
     mid = (min_s + max_s) / 2
@@ -53,35 +51,30 @@ def _medium_delay():
 def _long_delay():
     _human_delay(2.8, 5.0)
 
-
 def _log_section(title: str):
     logger.info("\n" + "─" * 70)
     logger.info(" %s", title)
     logger.info("─" * 70)
 
-
 def _save_log(log_entry: dict):
     try:
         os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
-
         existing = []
         if os.path.isfile(config.LOG_FILE):
             try:
-                with open(config.LOG_FILE, "r", encoding="utf-8") as file:
-                    content = file.read().strip()
+                with open(config.LOG_FILE, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
                     if content:
                         existing = json.loads(content)
                         if not isinstance(existing, list):
                             existing = [existing]
             except (json.JSONDecodeError, ValueError):
                 existing = []
-
         existing.append(log_entry)
-        with open(config.LOG_FILE, "w", encoding="utf-8") as file:
-            json.dump(existing, file, indent=2, ensure_ascii=False)
+        with open(config.LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=2, ensure_ascii=False)
     except Exception as exc:
         logger.warning("Erro ao salvar log: %s", exc)
-
 
 def _origem_product_key(produto: dict) -> str:
     if not isinstance(produto, dict) or not produto:
@@ -99,27 +92,22 @@ def _origem_product_key(produto: dict) -> str:
         return f"nome:{nome_lower}|{nome_hash}"
     return f"hash:{id(produto)}"
 
-
 # ====================== CACHE ======================
 DESTINO_CACHE: Dict[str, Any] = {}
-
 
 @retry_on_fail(max_attempts=4, backoff=1.8)
 def _preload_destino_cache(page: Any) -> bool:
     global DESTINO_CACHE
     DESTINO_CACHE.clear()
-
     page_size = 500
     page_number = 1
     total_pages = 1
     loaded_count = 0
-
     logger.info("🚀 Pré-carregando cache DESTINO...")
     token = destino_page._extract_destino_token(page)
     headers = {"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"}
     if token:
         headers["Authorization"] = token
-
     while page_number <= total_pages:
         url = f"{config.DESTINO_BASE}/admin/api/products?page[size]={page_size}&page[number]={page_number}&sort=name"
         try:
@@ -151,7 +139,6 @@ def _preload_destino_cache(page: Any) -> bool:
                 if sku:
                     DESTINO_CACHE[f"sku:{sku.lower()}"] = data_item
                 loaded_count += 1
-
             paging = data.get("paging") or {}
             total = int(paging.get("total") or 0)
             total_pages = max(1, (total + page_size - 1) // page_size)
@@ -161,15 +148,12 @@ def _preload_destino_cache(page: Any) -> bool:
         except Exception as e:
             logger.error(f"Erro preload página {page_number}: {e}")
             break
-
     logger.info(f"✅ Cache: {loaded_count} produtos | {len(DESTINO_CACHE)} chaves")
     return len(DESTINO_CACHE) > 100
-
 
 # ====================== LOAD ORIGEM ======================
 def _load_origem(context, cookies_origem, origem_url, source_user, source_pass, storage_origem=None):
     origem_source = str(getattr(config, "ORIGEM_SOURCE", "file") or "file").strip().lower()
-
     def _read_storage():
         if storage_origem and hasattr(storage_origem, "read_all"):
             try:
@@ -180,7 +164,6 @@ def _load_origem(context, cookies_origem, origem_url, source_user, source_pass, 
             except Exception as exc:
                 logger.warning("⚠️ Falha storage: %s", exc)
         return []
-
     def _read_file():
         path = os.path.join("produtos", "ProdutosOrigem.json")
         if os.path.isfile(path):
@@ -193,81 +176,57 @@ def _load_origem(context, cookies_origem, origem_url, source_user, source_pass, 
             except Exception as exc:
                 logger.warning("⚠️ Falha JSON: %s", exc)
         return []
-
     if origem_source == "tray_api":
         return _read_storage() or _read_file()
     return _read_file() or _read_storage() or []
 
+def _get_origem_infos(origem_prod: dict) -> list:
+    return domain._get_infos_from_product(origem_prod)
 
-# ══════════════════════════════════════════════════════════════════════
-# _is_additional_infos_model — Considera dados da ORIGEM
-# ══════════════════════════════════════════════════════════════════════
+def _get_origem_variacoes(origem_prod: dict) -> list:
+    return domain._get_variacoes_from_product(origem_prod)
+
 def _is_additional_infos_model(destino_json: dict, origem_prod: dict = None) -> bool:
     if not isinstance(destino_json, dict):
         return False
     has_variation = str(destino_json.get("has_variation", ""))
     properties_len = len(destino_json.get("Properties") or [])
     additional_infos_len = len(destino_json.get("AdditionalInfos") or [])
-
     if has_variation == "1" and properties_len > 0:
         return False
     if additional_infos_len > 0:
         return True
     if origem_prod and isinstance(origem_prod, dict):
         origem_infos = _get_origem_infos(origem_prod)
-        origem_vars = origem_prod.get("variacoes") or []
+        origem_vars = _get_origem_variacoes(origem_prod)
         if (origem_infos or origem_vars) and has_variation != "1" and properties_len == 0:
-            logger.info("🔍 Destino vazio + origem tem dados → modelo AdditionalInfos")
+            logger.info(
+                "🔍 Destino vazio + ORIGEM tem %d infos + %d variações → modelo AdditionalInfos",
+                len(origem_infos), len(origem_vars),
+            )
             return True
     return False
 
-
-# ══════════════════════════════════════════════════════════════════════
-# _get_origem_infos — Aceita formato Tray API e formato interno
-# ══════════════════════════════════════════════════════════════════════
-def _get_origem_infos(origem_prod: dict) -> list:
-    # Formato interno
-    infos = origem_prod.get("informacoes_adicionais") or []
-    if infos and isinstance(infos, list):
-        first = infos[0] if infos else {}
-        if isinstance(first, dict) and (first.get("nome") or first.get("opcoes")):
-            return infos
-
-    # Formato Tray API
-    tray_infos = origem_prod.get("AdditionalInfos") or []
-    if tray_infos and isinstance(tray_infos, list):
-        converted = _convert_tray_infos(tray_infos)
-        if converted:
-            return converted
-
-    # Formato interno com chaves Tray
-    if infos and isinstance(infos, list):
-        first = infos[0] if infos else {}
-        if isinstance(first, dict) and (first.get("name") or first.get("options")):
-            return _convert_tray_infos(infos)
-
-    return infos if isinstance(infos, list) else []
-
-
-def _convert_tray_infos(tray_infos: list) -> list:
-    result = []
-    for info in tray_infos:
-        if not isinstance(info, dict):
-            continue
-        nome = (info.get("name") or info.get("nome") or "").strip()
-        if not nome:
-            continue
-        info_type = (info.get("type") or "").strip().lower()
-        opcoes = []
-        for opt in (info.get("options") or info.get("opcoes") or []):
-            if not isinstance(opt, dict):
-                continue
-            opt_nome = (opt.get("name") or opt.get("nome") or "").strip()
-            if opt_nome:
-                opcoes.append({"nome": opt_nome, "valor": str(opt.get("value") or opt.get("valor") or "0.00")})
-        result.append({"nome": nome, "tipo": info_type or "select", "opcoes": opcoes})
-    return result
-
+def _force_additional_infos_for_rings(destino_json: dict, origem_prod: dict) -> bool:
+    nome = str(
+        (destino_json or {}).get("name") or 
+        (origem_prod or {}).get("nome") or ""
+    ).lower()
+    categoria = str(
+        (destino_json or {}).get("category_name") or 
+        (origem_prod or {}).get("categoria_name") or 
+        (origem_prod or {}).get("categoria") or ""
+    ).upper()
+    
+    if any(palavra in nome for palavra in ["anel", "anéis", "personalizado prata", "banho de ouro"]):
+        logger.info("🛡️ FORÇANDO Additional Infos model (produto de anel detectado)")
+        return True
+    
+    if categoria in ("ANÉIS", "ANEL", "JOIAS PERSONALIZADAS"):
+        logger.info("🛡️ FORÇANDO Additional Infos model (categoria de anéis detectada)")
+        return True
+        
+    return False
 
 def run_sync(
     context: Any,
@@ -279,66 +238,56 @@ def run_sync(
     cookies_origem: list = None,
 ):
     print("\n" + "═" * 80)
-    print("🔄 SYNC v8 — FIX OPÇÕES CHECKED + COOKIES")
+    print("🔄 SYNC v9 — FIX VARIAÇÕES→ADDITIONAL INFOS + ANÉIS FORÇADOS")
     print("═" * 80)
-
+    
     _log_section("ETAPA 1: Carregando ORIGEM")
     produtos = _load_origem(context, cookies_origem, origem_url, source_user, source_pass, storage_origem)
     if not produtos:
         print("❌ Nenhum produto na ORIGEM.")
         return
-
+    
+    if produtos:
+        sample = produtos[0]
+        keys = sorted(sample.keys()) if isinstance(sample, dict) else []
+        logger.info("📋 Campos no primeiro produto da ORIGEM: %s", keys)
+        has_variant = sum(1 for p in produtos[:50] if isinstance(p, dict) and (p.get("Variant") or p.get("variacoes")))
+        has_infos = sum(1 for p in produtos[:50] if isinstance(p, dict) and (p.get("AdditionalInfos") or p.get("informacoes_adicionais")))
+        logger.info("📊 Dos primeiros 50 produtos: %d com variações, %d com infos adicionais", has_variant, has_infos)
+    
     if getattr(config, "RATE_LIMIT", 0) > 0 and len(produtos) > config.RATE_LIMIT:
         produtos = produtos[:config.RATE_LIMIT]
+    
     if config.MODO_TESTE_APENAS_COM_INFOS:
-        produtos = [p for p in produtos if _get_origem_infos(p)]
-
+        produtos = [p for p in produtos if _get_origem_infos(p) or _get_origem_variacoes(p)]
+    
     pages = context.pages
     if not pages:
         print("❌ Nenhuma página aberta.")
         return
     page = pages[0]
-
+    
     cache_ok = _preload_destino_cache(page)
     if not cache_ok:
         logger.warning("⚠️ Cache incompleto, continuando...")
-
-    # ══════════════════════════════════════════════════════════════════════
-    # Verificar acesso à ORIGEM para leitura de opções checked
-    # ══════════════════════════════════════════════════════════════════════
+    
     origin_base = getattr(config, "ORIGEM_TRAY_BASE", "") or ""
     has_origin_access = bool(origin_base and cookies_origem)
-
     if has_origin_access:
-        # Debug: verificar tipo dos cookies
-        sample = cookies_origem[0] if cookies_origem else None
-        cookie_type = type(sample).__name__
-        logger.info(
-            "🔗 ORIGEM: %s | %d cookies (tipo: %s)",
-            origin_base, len(cookies_origem), cookie_type,
-        )
-        # Mostrar header que será construído
-        test_header = destino_api._build_cookie_header(cookies_origem)
-        logger.info("    Cookie header: %s...(%d chars)", test_header[:80], len(test_header))
+        cookie_header = destino_api._build_cookie_header(cookies_origem)
+        logger.info("🔗 ORIGEM: %s | cookie: %s...(%d chars)", origin_base, cookie_header[:60], len(cookie_header))
     else:
-        logger.warning(
-            "⚠️ Sem acesso à ORIGEM (origin_base=%s, cookies=%s). "
-            "Opções serão do JSON (PODE MARCAR TODAS EM VEZ DAS SELECIONADAS).",
-            bool(origin_base), bool(cookies_origem),
-        )
-
+        logger.warning("⚠️ Sem acesso à ORIGEM para ler opções checked")
+    
     _log_section("ETAPA 2: MATCHING")
     all_matches = destino_page.match_products_inteligente(
-        page=page,
-        origem_products=produtos,
-        destino_cache=DESTINO_CACHE,
-        logger=logger,
-        short_delay=_short_delay,
+        page=page, origem_products=produtos, destino_cache=DESTINO_CACHE,
+        logger=logger, short_delay=_short_delay,
     )
     if not all_matches:
-        print("❌ Nenhum match encontrado.")
+        print("❌ Nenhum match.")
         return
-
+    
     _log_section("ETAPA 3: PROCESSAMENTO")
     processed_count = 0
     failed_count = 0
@@ -348,35 +297,29 @@ def run_sync(
     processed_destino_ids = set()
     origem_por_destino_id = {}
     completed_origem_keys = set()
-
+    
     for match in all_matches:
         pid = match["destino_id"]
         nome = match["destino_name"]
         origem_prod = match["origem_product"]
         origem_key = _origem_product_key(origem_prod)
-
+        
         if str(pid) in blocked_ids:
             skipped_blocked_count += 1
             continue
-        if str(pid) in processed_destino_ids:
+        if str(pid) in processed_destino_ids or origem_key in completed_origem_keys:
             continue
-        if origem_key in completed_origem_keys:
-            continue
-
+        
         processed_destino_ids.add(str(pid))
         origem_por_destino_id[str(pid)] = (origem_prod.get("nome") or "")
         completed_origem_keys.add(origem_key)
-
+        
         logger.info(f"[{processed_count+1}/{target_count}] → {nome[:70]}")
         _short_delay()
-
+        
         destino_json, token = destino_page.fetch_product_and_token(page, pid, logger)
-        log_entry = {
-            "destino_id": pid,
-            "destino_name": nome,
-            "origem_nome": (origem_prod.get("nome") or ""),
-        }
-
+        log_entry = {"destino_id": pid, "destino_name": nome, "origem_nome": (origem_prod.get("nome") or "")}
+        
         if not destino_json or not token:
             logger.error(f"❌ Falha JSON/token produto {pid}")
             log_entry["status"] = "erro_json_token"
@@ -384,11 +327,10 @@ def run_sync(
             destino_page._append_live_result(destino_page.ENCONTRADOS_PATH, origem_prod.get("nome") or nome)
             _save_log(log_entry)
             continue
-
+        
         try:
             payload = domain.build_product_payload(origem_prod, destino_json)
             ok, status, body = destino_api.put_product(page, pid, payload, token)
-
             if not ok:
                 logger.error("❌ PUT falhou (ID %s, status %d): %s", pid, status, (body or "")[:200])
                 log_entry["status"] = "erro_put"
@@ -397,101 +339,172 @@ def run_sync(
                 destino_page._append_live_result(destino_page.ENCONTRADOS_PATH, origem_prod.get("nome") or nome)
                 _save_log(log_entry)
                 continue
-
+            
             log_entry["put_status"] = "sucesso"
             log_entry["put_http_status"] = status
-
-            # ══════════════════════════════════════════════════════════
-            # Infos + opções
-            # ══════════════════════════════════════════════════════════
+            
             infos_origem = _get_origem_infos(origem_prod)
-            variacoes_origem = origem_prod.get("variacoes", []) or []
-            destino_is_infos_model = _is_additional_infos_model(destino_json, origem_prod)
+            variacoes_origem = _get_origem_variacoes(origem_prod)
+            logger.info(
+                "📦 Produto ORIGEM: %d infos adicionais, %d variações",
+                len(infos_origem), len(variacoes_origem),
+            )
+            
+            if variacoes_origem:
+                for i, v in enumerate(variacoes_origem[:3]):
+                    sku_items = domain._extract_sku_items_from_variant(v)
+                    logger.info(" var[%d]: %s", i, sku_items)
+            
+            destino_is_infos_model = (
+                _is_additional_infos_model(destino_json, origem_prod) or
+                _force_additional_infos_for_rings(destino_json, origem_prod)
+            )
             infos_from_variacoes_mode = bool(destino_is_infos_model and variacoes_origem)
-
+            
             if infos_from_variacoes_mode:
                 infos_to_sync = domain.build_infos_for_additional_model(origem_prod)
                 source_context = "origem_infos+variacoes"
+                logger.info(
+                    "🔁 Modo infos_from_variacoes: %d variações + %d infos → %d infos merged",
+                    len(variacoes_origem), len(infos_origem), len(infos_to_sync),
+                )
             else:
                 infos_to_sync = infos_origem
                 source_context = "origem_infos"
-
+            
             should_create_fields = bool(infos_to_sync)
-
-            # ══════════════════════════════════════════════════════════
-            # Ler opções CHECKED da ORIGEM via HTTP
-            # ══════════════════════════════════════════════════════════
+            
+            # ==================== NOVA LÓGICA DE OPÇÕES CHECKED ====================
             origin_checked_options = None
             origem_product_id = str(
                 origem_prod.get("produto_id") or origem_prod.get("id") or ""
             ).strip()
 
-            if has_origin_access and origem_product_id and infos_to_sync:
-                logger.info("📖 Lendo opções checked da ORIGEM (produto %s)...", origem_product_id)
-                _short_delay()
-                try:
-                    origin_checked_options = destino_api.read_origin_checked_options(
+            if has_origin_access and origem_product_id:
+                logger.info("📖 Coletando opções checked da ORIGEM (produto %s)...", origem_product_id)
+
+                # PRIORIDADE MÁXIMA: Variações da origem (o que você precisa!)
+                if destino_is_infos_model and variacoes_origem:
+                    origin_checked_options = domain.extract_checked_options_from_variants(
+                        origem_prod,
                         page=page,
                         origin_base=origin_base,
-                        product_id=origem_product_id,
                         cookies_origem=cookies_origem,
                         logger=logger,
                     )
                     if origin_checked_options:
-                        total_opts = sum(len(v) for v in origin_checked_options.values())
-                        logger.info("✅ ORIGEM: %d campos, %d opções checked", len(origin_checked_options), total_opts)
+                        logger.info("✅ Usando VARIAÇÕES enriquecidas da origem como fonte de checkboxes")
                     else:
-                        logger.warning("⚠️ Não conseguiu ler opções da ORIGEM → fallback JSON")
-                except Exception as exc:
-                    logger.warning("⚠️ Erro lendo ORIGEM: %s → fallback", exc)
-                    origin_checked_options = None
+                        logger.warning("⚠️ Enriquecimento de variações retornou vazio")
 
+                # Fallback (caso tenha AdditionalInfos diretas na origem)
+                if not origin_checked_options:
+                    try:
+                        origin_checked_options = destino_api.read_origin_checked_options_playwright(
+                            page=page, origin_base=origin_base,
+                            product_id=origem_product_id,
+                            cookies_origem=cookies_origem, logger=logger,
+                        )
+                        if not origin_checked_options:
+                            origin_checked_options = destino_api.read_origin_checked_options(
+                                page=page, origin_base=origin_base,
+                                product_id=origem_product_id,
+                                cookies_origem=cookies_origem, logger=logger,
+                            )
+                    except Exception as exc:
+                        logger.warning("⚠️ Erro lendo ORIGEM: %s", exc)
+            # =====================================================================
+            
             logger.info(
                 "📋 Infos: %d | create=%s | source=%s | options=%s",
                 len(infos_to_sync), should_create_fields, source_context,
                 "ORIGEM_HTML" if origin_checked_options else "JSON_FALLBACK",
             )
-
+            
             sync_additional_infos(
-                page,
-                pid,
-                infos_to_sync,
-                token,
-                log_entry,
-                short_delay=_short_delay,
-                medium_delay=_medium_delay,
+                page, pid, infos_to_sync, token, log_entry,
+                short_delay=_short_delay, medium_delay=_medium_delay,
                 create_missing_fields=should_create_fields,
                 source_context=source_context,
                 origin_checked_options=origin_checked_options,
             )
-
+            
             sync_variants(
                 page, pid, origem_prod, token, log_entry,
                 short_delay=_short_delay, medium_delay=_medium_delay,
                 infos_already_synced=infos_from_variacoes_mode,
+                origin_base=origin_base,
+                cookies_origem=cookies_origem,
             )
 
+            # Se coletamos campos/opções via DOM na etapa de variantes, atualizar ORIGEM
+            try:
+                dom_opts = log_entry.get("variants_options_collected") or {}
+                origem_prod_id = str(origem_prod.get("produto_id") or origem_prod.get("id") or "").strip()
+                if dom_opts and origem_prod_id and origin_base and cookies_origem:
+                    infos_for_origin = []
+                    for prop, opts in dom_opts.items():
+                        op_list = []
+                        for o in opts:
+                            if not o or not str(o).strip():
+                                continue
+                            op_list.append({"nome": str(o).strip(), "valor": "0.00"})
+                        if op_list:
+                            infos_for_origin.append({"nome": prop, "opcoes": op_list})
+
+                    if infos_for_origin:
+                        logger.info("🔁 Atualizando AdditionalInfos NA ORIGEM (produto %s) com %d campos", origem_prod_id, len(infos_for_origin))
+                        ok, status, body = destino_api.put_origin_additional_infos(
+                            page, origin_base, origem_prod_id, infos_for_origin, cookies_origem, logger
+                        )
+                        if ok:
+                            logger.info("✅ ORIGEM AdditionalInfos atualizadas (status %s)", status)
+                            log_entry["origin_additional_infos_update"] = {"status": "ok", "http_status": status}
+                        else:
+                            logger.warning("⚠️ Falha atualizar ORIGEM AdditionalInfos: status=%s body=%s", status, (body or "")[:300])
+                            log_entry["origin_additional_infos_update"] = {"status": "error", "http_status": status, "detail": (body or "")[:400]}
+            except Exception as exc:
+                logger.warning("Erro atualizando ORIGEM AdditionalInfos: %s", exc)
+            
             destino_page.append_encontrado_sincronizado(origem_prod.get("nome") or nome)
             log_entry["status"] = "sucesso"
             _save_log(log_entry)
-
+        
         except Exception as exc:
-            logger.error("❌ Erro produto %s: %s", pid, exc)
+            logger.error("❌ Erro produto %s: %s", pid, exc, exc_info=True)
             log_entry["status"] = "erro_execucao"
             log_entry["erro"] = str(exc)
             failed_count += 1
             destino_page._append_live_result(destino_page.ENCONTRADOS_PATH, origem_prod.get("nome") or nome)
             _save_log(log_entry)
             continue
-
+        
         processed_count += 1
-        logger.info(f"✅ {processed_count}/{target_count} | {nome}")
+        # Adicionar informações de opções DOM coletadas, se houver
+        extra_lines = []
+        try:
+            dom_opts = log_entry.get("variants_options_collected") or {}
+            # dom_opts: { field_name: [opt1, opt2, ...], ... }
+            for field, opts in dom_opts.items():
+                if not opts:
+                    continue
+                clicks = []
+                for o in opts[:10]:
+                    txt = str(o).replace('"', '\\"')
+                    clicks.append(f'page.get_by_text("{txt}", exact=True).click()')
+                extra_lines.append(f"{field}: " + " ".join(clicks))
+        except Exception:
+            extra_lines = []
 
+        if extra_lines:
+            logger.info("✅ %s/%s | %s\n%s", processed_count, target_count, nome, "\n".join(extra_lines))
+        else:
+            logger.info(f"✅ {processed_count}/{target_count} | {nome}")
         if processed_count % 5 == 0:
             _medium_delay()
         else:
             _short_delay()
-
+    
     print(f"\n{'═' * 80}")
     print(f"✅ SYNC CONCLUÍDO — {processed_count}/{target_count}")
     if failed_count:

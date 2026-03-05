@@ -1,3 +1,4 @@
+#additional_info_sync.py
 import logging
 import time
 from typing import Dict, List, Optional
@@ -114,28 +115,21 @@ def sync_additional_infos(
             option_map = {}
 
         if origin_checked_options and norm_nome in origin_checked_options:
-            # ── Modo PRECISO: usar apenas labels realmente checked na ORIGEM ──
             checked_labels = origin_checked_options[norm_nome]
+            logger.info(
+                "    📌 MODO PRECISO (Variações → Checkboxes): '%s' → %d opções marcadas: %s",
+                nome, len(checked_labels), checked_labels[:10]
+            )
             matched = 0
             unmatched = []
-
             for label in checked_labels:
                 label_clean = label.strip()
-                if not label_clean:
-                    continue
-
-                # Procurar o option_id no catálogo do DESTINO pelo label
                 destino_option_id = option_map.get(domain.normalize(label_clean))
                 if destino_option_id:
                     option_info_entries.append(f"{destino_option_id}-{destino_id}")
                     matched += 1
                 else:
                     unmatched.append(label_clean)
-
-            logger.info(
-                "    📖 MODO PRECISO para '%s': %d checked na ORIGEM → %d mapeados, %d sem match",
-                nome, len(checked_labels), matched, len(unmatched),
-            )
             if unmatched:
                 opcoes_nao_encontradas[nome] = unmatched
                 logger.warning("    ⚠️ Opções sem match no DESTINO: %s", unmatched[:10])
