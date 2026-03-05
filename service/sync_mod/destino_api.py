@@ -1,4 +1,5 @@
 import json
+import logging
 import random
 import re
 import time
@@ -10,6 +11,44 @@ from patchright.sync_api import Page
 from .config import DESTINO_BASE
 from .domain import api_headers, normalize
 
+_logger = logging.getLogger("sync")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_cookie_header(cookies_origem) -> str:
+    """
+    Constrói a string do header Cookie a partir de cookies_origem,
+    aceitando AMBOS os formatos:
+      - Lista de dicts Playwright: [{"name": "x", "value": "y"}, ...]
+      - Lista de strings: ["name=value", ...]
+      - String única: "name=value; name2=value2"
+    """
+    if not cookies_origem:
+        return ""
+
+    if isinstance(cookies_origem, str):
+        return cookies_origem
+
+    parts = []
+    for c in cookies_origem:
+        if isinstance(c, dict):
+            name = c.get("name") or ""
+            value = c.get("value") or ""
+            if name:
+                parts.append(f"{name}={value}")
+        elif isinstance(c, str):
+            # Já é "name=value" ou "name=value; name2=value2"
+            parts.append(c)
+
+    return "; ".join(parts)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Product CRUD
+# ══════════════════════════════════════════════════════════════════════════════
 
 def get_product_details(page: Page, product_id: str, token: str, logger) -> Optional[dict]:
     url = f"{DESTINO_BASE}/admin/api/products/{product_id}"
@@ -43,6 +82,10 @@ def put_product(page: Page, product_id: str, payload: dict, token: str) -> Tuple
     except Exception as exc:
         return False, 0, str(exc)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Additional Info Catalog
+# ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_all_additional_infos(page: Page, token: str, logger) -> Dict[str, str]:
     info_map: Dict[str, str] = {}
@@ -260,6 +303,170 @@ def ensure_additional_info_with_options(
     return refreshed if isinstance(refreshed, dict) else info
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LEITURA DE OPÇÕES MARCADAS DA ORIGEM VIA HTTP
+# (Não usa browser/navegação — faz request HTTP direto com cookies)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def read_origin_checked_options(
+    page: Page,
+    origin_base: str,
+    product_id: str,
+    cookies_origem,
+    logger,
+) -> Dict[str, List[str]]:
+    """
+    Lê a página de additional_product_info da ORIGEM via HTTP GET
+    e retorna quais opções estão REALMENTE marcadas (checked).
+
+    Retorna: { normalized_field_name: [checked_option_labels] }
+    Exemplo: { "aro": ["09", "12", "13", "14", ...] }
+    """
+    url = (
+        f"{origin_base}/mvc/adm/additional_product_info/"
+        f"additional_product_info/edit/{product_id}"
+    )
+
+    cookie_str = _build_cookie_header(cookies_origem)
+    if not cookie_str:
+        logger.warning("⚠️ Sem cookies da ORIGEM — não é possível ler opções checked")
+        return {}
+
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Cookie": cookie_str,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        "Referer": f"{origin_base}/admin/products/{product_id}/edit",
+    }
+
+    try:
+        resp = page.request.get(url, headers=headers)
+        if resp.status != 200:
+            logger.warning("⚠️ GET opções ORIGEM produto %s: status %d", product_id, resp.status)
+            return {}
+
+        raw = resp.body()
+        try:
+            html = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            html = raw.decode("latin-1", errors="ignore")
+
+        if len(html) < 200:
+            logger.warning("⚠️ HTML da ORIGEM muito curto (%d bytes) — pode ser redirect/login", len(html))
+            return {}
+
+        # Verificar se caiu na página de login
+        html_lower = html.lower()
+        if 'type="password"' in html_lower or "name='password'" in html_lower:
+            logger.warning("⚠️ ORIGEM redirecionou para login — cookies inválidos/expirados")
+            return {}
+
+        return _parse_origin_html_options(html, logger)
+
+    except Exception as exc:
+        logger.warning("⚠️ Erro HTTP lendo opções ORIGEM produto %s: %s", product_id, exc)
+        return {}
+
+
+def _parse_origin_html_options(html: str, logger) -> Dict[str, List[str]]:
+    """
+    Parseia HTML da página additional_product_info da ORIGEM.
+
+    Estrutura HTML esperada (Tray Commerce):
+        Seção de um campo (ex: "993-Aro" ou "135-Aro"):
+            <input type="checkbox" class="options_135" name="option_info[]"
+                   value="789-135" checked> 12
+            <input type="checkbox" class="options_135" name="option_info[]"
+                   value="790-135"> 13     ← NÃO marcado
+
+    Retorna: { normalized_field_name: [labels_checked] }
+    """
+    # ── Passo 1: Mapear field_id → field_name ──
+    # Procura textos como "135-Aro", "993-Aro" etc.
+    field_id_to_name: Dict[str, str] = {}
+    for m in re.finditer(r'(\d{2,6})\s*[-–]\s*([^<"\n\r]{2,60})', html):
+        fid = m.group(1)
+        fname = m.group(2).strip().rstrip(':').strip()
+        if fname and fid not in field_id_to_name:
+            field_id_to_name[fid] = fname
+
+    # ── Passo 2: Encontrar todos os checkboxes option_info ──
+    # Captura: <input ... > LABEL_TEXT
+    checked_by_field: Dict[str, List[str]] = {}
+    unchecked_by_field: Dict[str, int] = {}
+
+    for match in re.finditer(
+        r'<input\b([^>]*)>([^<]{0,120})',
+        html,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        attrs = match.group(1)
+        label_text = match.group(2).strip()
+
+        # Só checkboxes de option_info
+        if not re.search(r'type\s*=\s*["\']checkbox["\']', attrs, re.IGNORECASE):
+            continue
+        if "option_info" not in attrs:
+            continue
+
+        # Extrair value (formato: OPTION_ID-FIELD_ID)
+        value_match = re.search(r'value\s*=\s*["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+        if not value_match:
+            continue
+
+        value = value_match.group(1)
+        parts = value.split("-")
+        if len(parts) < 2:
+            continue
+
+        field_id = parts[-1]  # último segmento = field ID
+        is_checked = bool(re.search(r'\bchecked\b', attrs, re.IGNORECASE))
+
+        # Label: texto após o input, ou fallback para option_id
+        label = label_text.strip() if label_text.strip() else parts[0]
+
+        if is_checked:
+            if field_id not in checked_by_field:
+                checked_by_field[field_id] = []
+            checked_by_field[field_id].append(label)
+        else:
+            unchecked_by_field[field_id] = unchecked_by_field.get(field_id, 0) + 1
+
+    # ── Passo 3: Converter field_id → normalized_name ──
+    result: Dict[str, List[str]] = {}
+    for fid, labels in checked_by_field.items():
+        fname = field_id_to_name.get(fid, fid)
+        norm = normalize(fname)
+        result[norm] = labels
+
+    if result:
+        total_checked = sum(len(v) for v in result.values())
+        total_unchecked = sum(unchecked_by_field.values())
+        logger.info(
+            "📖 ORIGEM HTML: %d campos | %d checked | %d unchecked",
+            len(result), total_checked, total_unchecked,
+        )
+        for name, opts in result.items():
+            fname = field_id_to_name.get(name, name)
+            unchecked = unchecked_by_field.get(
+                # Encontrar o field_id original para este nome
+                next((fid for fid, fn in field_id_to_name.items() if normalize(fn) == name), ""),
+                0,
+            )
+            logger.info("    '%s': %d checked, %d unchecked → %s", fname, len(opts), unchecked, opts[:10])
+    else:
+        logger.warning("⚠️ Nenhuma opção checked encontrada no HTML da ORIGEM")
+        # Debug: mostrar se encontrou algum checkbox
+        total_cb = len(re.findall(r'option_info', html))
+        logger.info("    (encontrados %d referências a option_info no HTML)", total_cb)
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Leitura de infos vinculadas do DESTINO (quais CAMPOS estão vinculados)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def get_product_current_infos(page: Page, product_id: str, logger) -> List[str]:
     url = (
         f"{DESTINO_BASE}/mvc/adm/additional_product_info/"
@@ -282,49 +489,92 @@ def get_product_current_infos(page: Page, product_id: str, logger) -> List[str]:
             html = raw_html.decode("utf-8")
         except UnicodeDecodeError:
             html = raw_html.decode("latin-1", errors="ignore")
-        current_ids = []
 
-        pattern_selected = re.findall(
-            r'name=["\']selected_items\[\]["\'].*?value=["\'](\d+)["\']',
-            html,
-            re.DOTALL,
-        )
-        if pattern_selected:
-            current_ids.extend(pattern_selected)
+        current_ids = set()
 
-        pattern_checked = re.findall(
-            r'<input[^>]*checked[^>]*value=["\'](\d+)["\'][^>]*name=["\'].*?selected',
-            html,
-            re.DOTALL,
-        )
-        if pattern_checked:
-            current_ids.extend(pattern_checked)
+        # selected_items[] (qualquer ordem de atributos)
+        for m in re.finditer(
+            r'<input[^>]*name\s*=\s*["\']selected_items\[\]["\'][^>]*value\s*=\s*["\'](\d+)["\']',
+            html, re.DOTALL | re.IGNORECASE,
+        ):
+            current_ids.add(m.group(1))
+        for m in re.finditer(
+            r'<input[^>]*value\s*=\s*["\'](\d+)["\'][^>]*name\s*=\s*["\']selected_items\[\]["\']',
+            html, re.DOTALL | re.IGNORECASE,
+        ):
+            current_ids.add(m.group(1))
 
-        pattern_checked2 = re.findall(
-            r'value=["\'](\d+)["\'][^>]*checked',
-            html,
-            re.DOTALL,
-        )
-        if pattern_checked2:
-            current_ids.extend(pattern_checked2)
+        # checked + value + selected
+        for m in re.finditer(
+            r'<input[^>]*\bchecked\b[^>]*value\s*=\s*["\'](\d+)["\'][^>]*name\s*=\s*["\']selected[^"\']*["\']',
+            html, re.DOTALL | re.IGNORECASE,
+        ):
+            current_ids.add(m.group(1))
+        for m in re.finditer(
+            r'<input[^>]*value\s*=\s*["\'](\d+)["\'][^>]*\bchecked\b[^>]*name\s*=\s*["\']selected[^"\']*["\']',
+            html, re.DOTALL | re.IGNORECASE,
+        ):
+            current_ids.add(m.group(1))
 
-        pattern_sort = re.findall(r'sort\[\].*?value=["\'](\d+)', html, re.DOTALL)
-        if pattern_sort:
-            current_ids.extend(pattern_sort)
+        # sort[]
+        for m in re.finditer(
+            r'name\s*=\s*["\']sort\[\]["\'][^>]*value\s*=\s*["\'](\d+)',
+            html, re.DOTALL | re.IGNORECASE,
+        ):
+            current_ids.add(m.group(1))
+        for m in re.finditer(
+            r'value\s*=\s*["\'](\d+)["\'][^>]*name\s*=\s*["\']sort\[\]["\']',
+            html, re.DOTALL | re.IGNORECASE,
+        ):
+            current_ids.add(m.group(1))
 
-        current_ids = list(set(current_ids))
-        logger.info(
-            "📎 Produto %s: %d infos adicionais atualmente vinculadas: %s",
-            product_id,
-            len(current_ids),
-            current_ids,
-        )
-        return current_ids
+        result = sorted(current_ids)
+        logger.info("📎 Produto %s: %d infos vinculadas: %s", product_id, len(result), result)
+        return result
 
     except Exception as exc:
         logger.warning("Erro ao buscar infos atuais do produto %s: %s", product_id, exc)
         return []
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Leitura de opções CHECKED do DESTINO (para comparação)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_product_current_checked_options(page: Page, product_id: str, logger) -> Dict[str, List[str]]:
+    """
+    Lê quais opções estão checked no DESTINO para comparação.
+    Usa a mesma lógica de parse que a ORIGEM.
+    """
+    url = (
+        f"{DESTINO_BASE}/mvc/adm/additional_product_info/"
+        f"additional_product_info/edit/{product_id}"
+    )
+    try:
+        resp = page.request.get(
+            url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        if resp.status != 200:
+            return {}
+
+        raw = resp.body()
+        try:
+            html = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            html = raw.decode("latin-1", errors="ignore")
+
+        return _parse_origin_html_options(html, logger)
+    except Exception:
+        return {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST de infos adicionais — CORRIGIDO
+# FIX: _method duplicado + login detection + option_info controlado
+# ══════════════════════════════════════════════════════════════════════════════
 
 def post_additional_infos(
     page: Page,
@@ -341,10 +591,15 @@ def post_additional_infos(
     try:
         page.goto(nav_url, wait_until="networkidle", timeout=15000)
         short_delay()
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.warning(
+            "⚠️ Nav p/ infos produto %s falhou: %s — tentando POST",
+            product_id, str(e)[:80],
+        )
 
-    parts = ["_method=POST", "_method=POST"]
+    # FIX: Apenas UM _method=POST
+    parts = ["_method=POST"]
+
     for info_id in info_ids_to_link:
         parts.append(f"selected_items%5B%5D={info_id}")
     parts.append(f"id_produto={product_id}")
@@ -358,6 +613,7 @@ def post_additional_infos(
         for info_id in info_ids_to_link:
             parts.append(f"sort%5B%5D={info_id}-")
 
+    # option_info[] controla quais opções individuais ficam checked
     if option_info_entries:
         for entry in option_info_entries:
             parts.append(f"option_info%5B%5D={entry}")
@@ -400,19 +656,30 @@ def post_additional_infos(
         snippet_lower = snippet.lower()
         final_url_lower = final_url.lower()
 
-        redirected_to_login = ("/admin/login" in final_url_lower) or ("/login" in final_url_lower and "/admin" in final_url_lower)
-        login_in_html = ("type=\"password\"" in snippet_lower) or ("name=\"password\"" in snippet_lower)
+        redirected_to_login = any(p in final_url_lower for p in [
+            "/admin/login", "/mvc/adm/login", "/adm/login", "/login?", "/login#",
+        ])
+        login_in_html = any(p in snippet_lower for p in [
+            'type="password"', "type='password'", 'name="password"', "name='password'",
+        ])
 
         ok = (status in (200, 302) or bool(result.get("ok"))) and not redirected_to_login and not login_in_html
         detail = f"status={status}, redirected={redirected}, final={final_url}"
 
         if not ok and not snippet.strip():
             detail += ", empty-response"
+        if redirected_to_login or login_in_html:
+            detail += ", REDIRECT_LOGIN"
+            _logger.error("🚨 Sessão expirada! POST produto %s → login", product_id)
 
         return ok, detail
     except Exception as exc:
         return False, str(exc)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Variações, Propriedades, etc. (sem mudanças)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def get_destino_variants(page: Page, product_id: str, token: str, logger) -> Tuple[list, dict]:
     all_variants = []
@@ -432,9 +699,7 @@ def get_destino_variants(page: Page, product_id: str, token: str, logger) -> Tup
             items = data.get("data", [])
             if not items:
                 break
-
             all_variants.extend(items)
-
             paging = data.get("paging", {})
             total = paging.get("total", 0)
             total_pages = max(1, (total + 24) // 25)
@@ -453,7 +718,6 @@ def get_destino_variants(page: Page, product_id: str, token: str, logger) -> Tup
 def get_destino_properties(page: Page, token: str, logger) -> Dict[str, str]:
     prop_map: Dict[str, str] = {}
     page_num = 1
-
     while True:
         url = f"{DESTINO_BASE}/admin/api/properties?sort=id&page[size]=25&page[number]={page_num}"
         try:
@@ -464,13 +728,11 @@ def get_destino_properties(page: Page, token: str, logger) -> Dict[str, str]:
             items = data.get("data", [])
             if not items:
                 break
-
             for item in items:
                 name = (item.get("name") or "").strip()
                 prop_id = item.get("id")
                 if name and prop_id:
                     prop_map[normalize(name)] = str(prop_id)
-
             total = data.get("paging", {}).get("total", 0)
             total_pages = max(1, (total + 24) // 25)
             if page_num >= total_pages:
@@ -480,10 +742,7 @@ def get_destino_properties(page: Page, token: str, logger) -> Dict[str, str]:
         except Exception as exc:
             logger.warning("Erro GET properties pág %d: %s", page_num, exc)
             break
-
     logger.info("🏷️ Propriedades DESTINO: %d", len(prop_map))
-    for key, value in prop_map.items():
-        logger.info("    '%s' → ID %s", key, value)
     return prop_map
 
 
@@ -496,11 +755,11 @@ def get_property_values(page: Page, property_id: str, token: str, logger) -> Dic
         data = resp.json()
         prop_data = data.get("data", {})
         values: Dict[str, str] = {}
-        for property_value in (prop_data.get("PropertyValues") or []):
-            name = (property_value.get("name") or "").strip()
-            value_id = property_value.get("id")
-            if name and value_id:
-                values[normalize(name)] = str(value_id)
+        for pv in (prop_data.get("PropertyValues") or []):
+            name = (pv.get("name") or "").strip()
+            vid = pv.get("id")
+            if name and vid:
+                values[normalize(name)] = str(vid)
         return values
     except Exception as exc:
         logger.warning("Erro GET property %s values: %s", property_id, exc)
@@ -510,35 +769,27 @@ def get_property_values(page: Page, property_id: str, token: str, logger) -> Dic
 def append_property_value(page: Page, property_id: str, value_name: str, token: str, logger) -> Optional[str]:
     url = f"{DESTINO_BASE}/admin/api/properties/{property_id}/append-values"
     payload = {"data": {"name": value_name}}
-
     try:
-        resp = page.request.post(
-            url=url,
-            data=json.dumps(payload),
-            headers=api_headers(token),
-        )
+        resp = page.request.post(url=url, data=json.dumps(payload), headers=api_headers(token))
         if resp.status == 200:
             data = resp.json()
-            prop_values = data.get("data", {}).get("PropertyValues", [])
-            for property_value in reversed(prop_values):
-                if normalize(property_value.get("name", "")) == normalize(value_name):
-                    value_id = str(property_value["id"])
-                    logger.info("    ✅ Valor '%s' criado → ID %s", value_name, value_id)
-                    return value_id
-            if prop_values:
-                value_id = str(prop_values[-1]["id"])
-                logger.info("    ✅ Valor '%s' criado (último) → ID %s", value_name, value_id)
-                return value_id
+            for pv in reversed(data.get("data", {}).get("PropertyValues", [])):
+                if normalize(pv.get("name", "")) == normalize(value_name):
+                    vid = str(pv["id"])
+                    logger.info("    ✅ Valor '%s' → ID %s", value_name, vid)
+                    return vid
+            pvs = data.get("data", {}).get("PropertyValues", [])
+            if pvs:
+                return str(pvs[-1]["id"])
         else:
             body = ""
             try:
                 body = resp.text()[:300]
             except Exception:
                 pass
-            logger.error("    ❌ append-values falhou: status %d — %s", resp.status, body)
+            logger.error("    ❌ append-values: status %d — %s", resp.status, body)
     except Exception as exc:
         logger.error("    ❌ append-values erro: %s", exc)
-
     return None
 
 
@@ -559,11 +810,7 @@ def delete_variant(page: Page, variant_id: str, token: str, logger) -> bool:
 def put_variants(page: Page, product_id: str, variants_payload: list, token: str) -> Tuple[bool, int, str]:
     url = f"{DESTINO_BASE}/admin/api/products/{product_id}/variants"
     try:
-        resp = page.request.put(
-            url=url,
-            data=json.dumps({"data": variants_payload}),
-            headers=api_headers(token),
-        )
+        resp = page.request.put(url=url, data=json.dumps({"data": variants_payload}), headers=api_headers(token))
         body = ""
         try:
             body = resp.text()[:500]
@@ -577,11 +824,7 @@ def put_variants(page: Page, product_id: str, variants_payload: list, token: str
 def post_variants(page: Page, product_id: str, variants_payload: list, token: str) -> Tuple[bool, int, str]:
     url = f"{DESTINO_BASE}/admin/api/products/{product_id}/variants"
     try:
-        resp = page.request.post(
-            url=url,
-            data=json.dumps({"data": variants_payload}),
-            headers=api_headers(token),
-        )
+        resp = page.request.post(url=url, data=json.dumps({"data": variants_payload}), headers=api_headers(token))
         body = ""
         try:
             body = resp.text()[:500]
