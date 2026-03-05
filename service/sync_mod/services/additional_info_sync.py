@@ -1,4 +1,3 @@
-# additional_info_sync.py (ATUALIZADO)
 import logging
 import time
 from typing import Dict, List, Optional
@@ -62,17 +61,20 @@ def sync_additional_infos(
         destino_info = info_catalog.get(norm_nome)
         destino_id = destino_info.get("id") if destino_info else None
 
+        # opções da origem: lista de nomes
         opcoes_origem = info.get("opcoes") or []
         opcoes_nomes = [op.get("nome", "").strip() for op in opcoes_origem if op.get("nome", "").strip()]
 
-        # Detectar textual: sem opções reais ou apenas a opção dummy "Valor padrão"
+        # Sempre assume textual se veio sem opções reais ou só dummy
         is_textual = (
-            len(opcoes_origem) == 0
-            or all(("Valor padrão" in (o.get("nome") or "") or "valor padrão" in (o.get("nome") or "").lower())
-                   for o in opcoes_origem)
+            len(opcoes_nomes) <= 1
+            and (not opcoes_nomes or "Valor padrão" in opcoes_nomes[0] or opcoes_nomes[0] == "")
         )
-        # field_type: "T" = textarea/textual, "I" = input (single-line), "S" = select/options
-        field_type = "T" if is_textual else "S"
+
+        # Força "I" (linha de texto) para campos textuais da origem
+        field_type = "I" if is_textual else "S"
+
+        logger.info("Campo '%s': is_textual=%s → field_type=%s", nome, is_textual, field_type)
 
         # Criar campo + opções se permitido
         if create_missing_fields and (not destino_id or (opcoes_nomes and destino_info)):
@@ -94,15 +96,15 @@ def sync_additional_infos(
         sort_entries.append(f"{destino_id}-")
         logger.info("Campo '%s' → ID destino %s (tipo=%s)", nome, destino_id, field_type)
 
-        # Decidir quais opções marcar — pular marcação se campo textual
-        option_map = destino_info.get("option_map", {}) if destino_info else {}
-        matched = 0
-
-        if field_type == "T":
-            # textual: não marcar opções (não faz sentido)
-            logger.debug("Campo '%s' é textual → não serão marcadas opções", nome)
+        # Se for textual e destino_id existe, pular marcação de opções
+        if is_textual and destino_id:
+            logger.info("Campo textual '%s' → pulando marcação de opções", nome)
             opcoes_stats[nome] = {"mapped": 0, "total_origem": len(opcoes_nomes), "tipo": "textual"}
             continue
+
+        # Decidir quais opções marcar — campo select
+        option_map = destino_info.get("option_map", {}) if destino_info else {}
+        matched = 0
 
         if origin_checked_options and norm_nome in origin_checked_options:
             checked = origin_checked_options[norm_nome]
@@ -125,7 +127,7 @@ def sync_additional_infos(
                 else:
                     opcoes_nao_encontradas.setdefault(nome, []).append(op_nome)
 
-        opcoes_stats[nome] = {"mapped": matched, "total_origem": len(opcoes_nomes), "tipo": ("select" if not is_textual else "textual")}
+        opcoes_stats[nome] = {"mapped": matched, "total_origem": len(opcoes_nomes), "tipo": "select"}
 
     if not ids_desejados:
         logger.warning("Nenhum campo pôde ser vinculado")

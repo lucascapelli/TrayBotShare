@@ -1,4 +1,5 @@
 # domain.py
+# domain.py
 import logging
 import unicodedata
 from typing import Dict, List
@@ -133,7 +134,6 @@ def _get_infos_from_product(produto: dict) -> list:
         logger.warning("Produto ORIGEM não é dict válido")
         return []
 
-    # Desembrulhar 'data' se existir
     if "data" in produto and isinstance(produto["data"], dict):
         produto = produto["data"]
         logger.debug("Desembrulhado 'data' do produto origem")
@@ -162,15 +162,7 @@ def _get_infos_from_product(produto: dict) -> list:
                         opt_val = opt.get("value") or opt.get("price") or "0.00"
                         opcoes.append({"nome": opt_nome, "valor": str(opt_val)})
 
-                # Preserve type and do NOT force dummy options for textual fields.
-                tipo_original = info.get("type", "text")
-                # antigo comportamento: criar opção dummy para text/textarea — REMOVIDO
-
-                converted.append({
-                    "nome": nome,
-                    "opcoes": opcoes,
-                    "tipo": tipo_original
-                })
+                converted.append({"nome": nome, "opcoes": opcoes})
 
             if converted:
                 logger.info("Retornando %d infos convertidas", len(converted))
@@ -194,7 +186,6 @@ def build_infos_for_additional_model(origem_product: dict) -> list:
     variacoes = _get_variacoes_from_product(origem_product)
     infos_variacoes = build_additional_infos_from_variacoes(variacoes)
 
-    # FORÇADO: priorizar variações se não houver infos textuais
     if not infos_origem and infos_variacoes:
         logger.info("FORÇADO: usando SOMENTE variações como AdditionalInfos (%d campos)", len(infos_variacoes))
         return infos_variacoes
@@ -316,92 +307,12 @@ def extract_checked_options_from_variants(
         logger.warning("ID do produto não encontrado para extrair variações")
         return result
 
-    if page and origin_base and cookies_origem:
-        try:
-            try:
-                from . import destino_api
-            except Exception:
-                import service.sync_mod.destino_api as destino_api
-        except Exception:
-            destino_api = None
-
-        try:
-            logger.info("🔄 Tentando endpoint /products-variants para produto %s", product_id)
-            cookie_str = ""
-            try:
-                if destino_api:
-                    cookie_str = destino_api._build_cookie_header(cookies_origem)
-            except Exception:
-                cookie_str = ""
-
-            headers = {
-                "Accept": "application/json",
-                "X-Requested-With": "XMLHttpRequest",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": f"{origin_base}/admin/products/{product_id}/edit",
-            }
-            if cookie_str:
-                headers["Cookie"] = cookie_str
-
-            try:
-                if destino_api:
-                    token = destino_api._extract_origin_token(page)
-                    if token:
-                        headers["Authorization"] = token
-                        logger.info("🔑 Usando Authorization Bearer para /products-variants")
-            except Exception:
-                pass
-
-            url = (
-                f"{origin_base}/admin/api/products-variants"
-                f"?filter[product_id]={product_id}&page[size]=100&sort=order"
-            )
-            try:
-                resp = page.request.get(url, headers=headers, timeout=25000)
-                if resp.status == 200:
-                    data = resp.json()
-                    variants = data.get("data", [])
-                    for var in variants:
-                        sku_items = _extract_sku_items_from_variant(var)
-                        for item in sku_items:
-                            field_raw = (item.get("type") or item.get("property_name") or "").strip()
-                            value = str(item.get("value") or item.get("name") or "").strip()
-                            if not field_raw or not value:
-                                continue
-                            field_name = canonical_info_name(field_raw)
-                            norm_field = normalize(field_name)
-                            result.setdefault(norm_field, [])
-                            if value not in result[norm_field]:
-                                result[norm_field].append(value)
-
-                    if result:
-                        logger.info("🔄 [CHECKED PRECISO] Extraídos %d campos via /products-variants", len(result))
-                        return result
-            except Exception as exc:
-                logger.warning("Erro chamando /products-variants: %s", exc)
-        except Exception:
-            pass
-
-    # Fallback individual
     variacoes = _get_variacoes_from_product(origem_product)
     if not variacoes:
         return result
 
     for var in variacoes:
-        var_id = str(var.get("id") or "")
         sku_items = _extract_sku_items_from_variant(var)
-        if not sku_items and var_id and page and origin_base and cookies_origem:
-            try:
-                if destino_api:
-                    details = destino_api.fetch_origin_variant_details(
-                        page=page, origin_base=origin_base, product_id=product_id,
-                        variant_id=var_id, cookies_origem=cookies_origem, logger=logger
-                    )
-                    if details:
-                        sku_items = _extract_sku_items_from_variant(details)
-            except Exception:
-                pass
-
         for item in sku_items:
             field_raw = (item.get("type") or "").strip()
             value = str(item.get("value") or "").strip()

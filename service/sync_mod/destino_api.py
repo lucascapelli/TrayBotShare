@@ -1,28 +1,4 @@
-# ========================== destino_api.py (PATCHES INTEGRADOS) ==========================
-#
-# CHANGELOG (patches sobre versão anterior):
-#   [PATCH-A] fetch_origin_variants_full() — NOVO (melhorado)
-#             Busca os objetos COMPLETAS de variação via GET /variants na origem.
-#             Aceita autenticação via Cookie e/ou Authorization header.
-#
-#   [PATCH-B] fetch_origin_auth_token() — NOVO
-#             Intercepta o Bearer token que a página de edição da origem usa,
-#             abrindo a página e monitorando as requisições XHR.
-#
-#   [PATCH-C] _parse_origin_html_options() — MELHORADO
-#             (mantido)
-#
-# Ajustes adicionais nesta versão:
-#   - fetch_origin_variants_full aceita token fallback quando cookies ausentes
-#   - read_origin_checked_options tenta múltiplas URLs e usa token quando cookies falham
-#   - adicionadas funções utilitárias para extrair PropertyValue IDs de variantes
-#   - logs adicionais para esclarecer counts e método de autenticação
-#
-# Todos os demais métodos mantidos ou levemente adaptados para compatibilidade.
-#
-# Obs: substitua por inteiro este arquivo no seu projeto para garantir que o
-# post_additional_infos novo e os patches estejam presentes.
-#
+# ========================== destino_api.py ==========================
 import json
 import logging
 import random
@@ -168,7 +144,7 @@ def collect_property_value_ids_from_variants(variants: List[dict]) -> List[str]:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [PATCH-A] fetch_origin_variants_full — NOVO (aceita token fallback)
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_origin_variants_full(
     page: Page,
@@ -455,7 +431,7 @@ def fetch_origin_auth_token(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Product CRUD (sem alterações)
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def get_product_details(
     page: Page, product_id: str, token: str, logger
@@ -816,7 +792,7 @@ def _post_form_urlencoded(
 
 
 def _create_additional_info_field(
-    page: Page, info_name: str, logger, field_type: str = "S"
+    page: Page, info_name: str, logger, field_type: str = "I"
 ) -> bool:
     """
     Cria um campo Additional Info no DESTINO.
@@ -829,22 +805,23 @@ def _create_additional_info_field(
       - Para text/input (T/I) => obrigatorio = 0, add_total = 0
       - Para select (S) => obrigatorio = 1, add_total = 1
     """
-    # Definir flags de acordo com tipo
-    obrigatorio_flag = "0" if field_type in ("T", "I") else "1"
-    add_total_flag = "0" if field_type in ("T", "I") else "1"
-
     form_data = {
         "nome_loja": info_name,
-        "nome_adm":  info_name,
-        "ativa":     "1",
+        "nome_adm": info_name,
+        "ativa": "1",
         "exibir_valor": "0",
-        "obrigatorio":  obrigatorio_flag,
-        "contador":     "0",
-        "tipo":         field_type,
-        "valor":        "0.00",
-        "add_total":    add_total_flag,
-        "ordem":        "0",
+        "obrigatorio": "0" if field_type in ("I", "T") else "1",
+        "contador": "0",
+        "tipo": field_type,  # "I" deve ser input single-line
+        "valor": "0.00",
+        "add_total": "0" if field_type in ("I", "T") else "1",
+        "ordem": "0",
+        "max_length": "80" if field_type == "I" else "0",  # limite bom para nome/frase
+        "height": "0" if field_type == "I" else "120",     # height 0 força input single-line
     }
+
+    # Log do form_data pra debug
+    logger.debug("Criando campo '%s' com form_data: %s", info_name, form_data)
 
     endpoints = [
         f"{DESTINO_BASE}/adm/extras/informacao_produto_executar.php?acao=incluir",
@@ -1099,65 +1076,27 @@ def post_additional_infos(
         if not csrf_token:
             _logger.warning("⚠️ Nenhum CSRF token encontrado na página — enviando sem (pode falhar)")
 
-        # 3. Monta payload exatamente como o form real envia
-        payload = {
+        # 3. Monta payload de LIMPEZA (desmarcar todas as opções)
+        _logger.info("Enviando POST de limpeza para desmarcar opções existentes...")
+        clean_payload = {
             "_method": "POST",
             "id_produto": str(product_id),
             "data[AdditionalProductInfo][herda_prazo]": "0",
             "data[AdditionalProductInfo][prazo]": "0",
+            "commit": "Salvar",
+            "action": "edit",
         }
-
-        # selected_items[] — formato indexado (muito comum no Tray)
-        for i, info_id in enumerate(info_ids_to_link):
-            payload[f"selected_items[{i}]"] = str(info_id)
-
-        # sort[] — mantém ordem enviada ou default
-        if sort_entries:
-            for i, s in enumerate(sort_entries):
-                payload[f"sort[{i}]"] = s
-        else:
-            for i, info_id in enumerate(info_ids_to_link):
-                payload[f"sort[{i}]"] = f"{info_id}-"
-
-        # option_info[] — as opções checked (ex: 2839-951)
-        if option_info_entries:
-            for i, entry in enumerate(option_info_entries):
-                payload[f"option_info[{i}]"] = entry
-
-        # Adiciona CSRF se encontrado
+        for i, sid in enumerate(info_ids_to_link):
+            clean_payload[f"selected_items[{i}]"] = str(sid)
+        for i, s in enumerate(sort_entries or []):
+            clean_payload[f"sort[{i}]"] = s
         if csrf_token:
-            payload["_token"] = csrf_token
+            clean_payload["_token"] = csrf_token
 
-        # Campos extras comuns no Tray (commit, etc.)
-        payload["commit"] = "Salvar"
-        payload["action"] = "edit"
+        clean_body = urlencode(clean_payload, doseq=True, encoding='utf-8', errors='replace')
 
-        # =========================
-        # Limpeza prévia: desmarcar tudo antes de enviar os selecionados
-        # =========================
+        # enviar via fetch usando headers com charset
         try:
-            _logger.info("Enviando POST de limpeza (desmarcar tudo)...")
-            clean_payload = {
-                "_method": "POST",
-                "id_produto": str(product_id),
-                "data[AdditionalProductInfo][herda_prazo]": "0",
-                "data[AdditionalProductInfo][prazo]": "0",
-            }
-            # incluir selected_items com os mesmos índices (o objetivo é forçar regravação)
-            for i, sid in enumerate(info_ids_to_link):
-                clean_payload[f"selected_items[{i}]"] = str(sid)
-            # manter sort se houver
-            for i, s in enumerate(sort_entries or []):
-                clean_payload[f"sort[{i}]"] = s
-            if csrf_token:
-                clean_payload["_token"] = csrf_token
-            clean_payload["commit"] = "Salvar"
-            clean_payload["action"] = "edit"
-
-            # garantir UTF-8 no urlencode da limpeza
-            clean_body = urlencode(clean_payload, doseq=True, encoding="utf-8")
-
-            # enviar via fetch usando headers com charset
             clean_result = page.evaluate(
                 """
                 async ([url, body, origin]) => {
@@ -1201,8 +1140,30 @@ def post_additional_infos(
         # esperar propagation após limpeza (4-5s recomendado)
         time.sleep(5)
 
-        # Converte para string urlencoded (forçando UTF-8)
-        body_str = urlencode(payload, doseq=True, encoding="utf-8")
+        # 4. Monta payload PRINCIPAL (agora com opções corretas)
+        payload = {
+            "_method": "POST",
+            "id_produto": str(product_id),
+            "data[AdditionalProductInfo][herda_prazo]": "0",
+            "data[AdditionalProductInfo][prazo]": "0",
+            "commit": "Salvar",
+            "action": "edit",
+        }
+        # selected_items e sort iguais
+        for i, info_id in enumerate(info_ids_to_link):
+            payload[f"selected_items[{i}]"] = str(info_id)
+        for i, s in enumerate(sort_entries or []):
+            payload[f"sort[{i}]"] = s
+        if csrf_token:
+            payload["_token"] = csrf_token
+
+        # option_info só as desejadas
+        if option_info_entries:
+            for i, entry in enumerate(option_info_entries):
+                payload[f"option_info[{i}]"] = entry
+
+        # Encoding correto!
+        body_str = urlencode(payload, doseq=True, encoding='utf-8', errors='replace')
 
         _logger.debug(
             "POST payload completo (urlencoded): %s",
@@ -1214,7 +1175,15 @@ def post_additional_infos(
             len(option_info_entries or []),
         )
 
-        # 4. Envia via fetch no evaluate (mantém cookies/sessão do Playwright)
+        # Headers com charset explícito (usado dentro do evaluate abaixo)
+        headers_in_fetch = {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': edit_url,
+            'Origin': DESTINO_BASE.rstrip("/")
+        }
+
+        # 5. Envia via fetch no evaluate (mantém cookies/sessão do Playwright)
         result = page.evaluate(
             """
             async ([url, body, origin]) => {
@@ -1265,7 +1234,7 @@ def post_additional_infos(
 
         _logger.info("POST additional_infos → %s", detail)
 
-        # 5. Validação pós-envio (delay + reload + reconsulta)
+        # 6. Validação pós-envio (delay + reload + reconsulta)
         if ok:
             _logger.info("POST aparentemente aceito → aguardando propagação no Tray...")
             time.sleep(6)  # Tray pode demorar para refletir no banco
